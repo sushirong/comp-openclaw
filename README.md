@@ -11,6 +11,7 @@
 - 原始协议调用能力
 - 返回解析后纯文本的对话调用能力
 - 返回原始 `event` 消息体列表的对话调用能力
+- 返回小塔 APP 兼容事件对象列表的对话调用能力
 - 控制台对话 Demo
 
 如果你的目标是把它作为 SDK 集成到其他项目中，重点关注“SDK 使用方式”和“对话调用方式”章节。
@@ -164,6 +165,7 @@ mvn clean install
 - `com.example.openclaw.client.OpenClawConfig`
 - `com.example.openclaw.client.OpenClawClient`
 - `com.example.openclaw.model.OpenClawMessage`
+- `com.example.openclaw.model.TowerAppSseEvent`
 
 `OpenClawMessage` 是统一消息模型，主要字段如下：
 
@@ -340,7 +342,64 @@ try (OpenClawClient client = OpenClawClient
 - 你要做调试、审计、落库或回放
 - 你要观察完整事件链路
 
-### 7.4 `setEventListener(...)`
+在需要直接对接小塔 APP 响应协议时，可以使用带映射类型的重载方法。
+
+### 7.4 `sendChatRawEvents(..., RawEventMappingType.TOWER_APP)`
+
+返回按小塔 APP 协议映射后的兼容事件对象列表：
+
+```java
+sendChatRawEvents(String message, RawEventMappingType mappingType)
+sendChatRawEvents(String sessionKey, String message, RawEventMappingType mappingType)
+sendChatRawEvents(String sessionKey, String message, Duration requestTimeout, Duration streamTimeout, RawEventMappingType mappingType)
+```
+
+示例：
+
+```java
+import com.example.openclaw.client.OpenClawClient;
+import com.example.openclaw.client.OpenClawClient.RawEventMappingType;
+import com.example.openclaw.model.TowerAppSseEvent;
+
+import java.util.List;
+
+try (OpenClawClient client = OpenClawClient
+        .init("ws://127.0.0.1:18789", "你的token")
+        .join()) {
+    List<TowerAppSseEvent> events = client.sendChatRawEvents(
+            "请输出适合小塔 APP 消费的响应事件",
+            RawEventMappingType.TOWER_APP
+    ).join();
+
+    for (TowerAppSseEvent event : events) {
+        System.out.println("sseType = " + event.getSseType());
+        System.out.println("eventData = " + event.getEventData());
+        System.out.println("errorMsg = " + event.getErrorMsg());
+    }
+}
+```
+
+说明：
+
+- 该重载不会改变原有 `sendChatRawEvents(...)` 的行为
+- 原有方法仍然返回 `List<String>` 原始事件列表
+- 只有显式传入 `RawEventMappingType.TOWER_APP` 时，才会执行小塔 APP 协议映射
+
+映射规则：
+
+- `agent.lifecycle.start` 映射为 `message`，并返回空字符串 `answer`
+- `agent.assistant.data.delta` 映射为 `message`，`answer` 取增量文本
+- `agent.lifecycle.end` 映射为 `message_end`
+- `chat.state=error` 映射为 `error`
+- 忽略 `chat.state=delta`，避免和 `agent.assistant.data.delta` 重复拼接
+
+适用场景：
+
+- 你要把 SDK 输出直接适配到小塔 APP 桌面端
+- 你希望保留流式事件语义，但不想自己写字段映射逻辑
+- 你需要拿到 `sseType / eventData / errorMsg` 这一层兼容结构
+
+### 7.5 `setEventListener(...)`
 
 如果你需要实时监听事件，可以使用：
 

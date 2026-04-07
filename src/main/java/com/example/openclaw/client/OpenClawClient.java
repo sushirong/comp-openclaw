@@ -1,6 +1,7 @@
 package com.example.openclaw.client;
 
 import com.example.openclaw.model.OpenClawMessage;
+import com.example.openclaw.model.TowerAppSseEvent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -93,6 +94,17 @@ public final class OpenClawClient implements AutoCloseable {
     private volatile WebSocket webSocket;
     // 保存外部注册的事件监听器。
     private volatile Consumer<OpenClawMessage> eventListener;
+
+    /**
+     * 原始事件的附加映射类型。
+     * <p>
+     *这里单独抽一个枚举，而不是直接新增布尔参数，是为了后续如果还要支持其他
+     * 下游消费格式时，可以继续通过重载扩展而不破坏现有方法签名。
+     */
+    public enum RawEventMappingType {
+        // 将原始事件映射成小塔 APP 可直接消费的 SSE 外层对象。
+        TOWER_APP
+    }
 
     /**
      * 使用配置对象创建客户端。
@@ -308,6 +320,65 @@ public final class OpenClawClient implements AutoCloseable {
     }
 
     /**
+     * 使用默认会话发送聊天请求，并把原始事件映射为指定兼容格式。
+     *
+     * <p>该重载不会影响原有 {@code sendChatRawEvents(String)} 的返回结果。
+     * 原方法仍然返回原始字符串事件列表；只有显式传入 {@link RawEventMappingType}
+     * 时，才会执行附加的协议转换。
+     *
+     * @param message 用户输入消息
+     * @param mappingType 原始事件映射类型
+     * @return 小塔 APP 兼容事件对象列表
+     */
+    public CompletableFuture<List<TowerAppSseEvent>> sendChatRawEvents(String message, RawEventMappingType mappingType) {
+        return sendChatRawEvents(DEFAULT_SESSION_KEY, message, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_TIMEOUT, mappingType);
+    }
+
+    /**
+     * 使用指定会话发送聊天请求，并把原始事件映射为指定兼容格式。
+     *
+     * <p>该方法适合调用方已经自己维护会话上下文的场景，映射逻辑与默认会话版本完全一致。
+     *
+     * @param sessionKey 会话标识，为空时内部仍会回退到默认会话
+     * @param message 用户输入消息
+     * @param mappingType 原始事件映射类型
+     * @return 小塔 APP 兼容事件对象列表
+     */
+    public CompletableFuture<List<TowerAppSseEvent>> sendChatRawEvents(
+            String sessionKey,
+            String message,
+            RawEventMappingType mappingType
+    ) {
+        return sendChatRawEvents(sessionKey, message, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_TIMEOUT, mappingType);
+    }
+
+    /**
+     * 发送聊天请求，并把原始事件映射为指定兼容格式。
+     *
+     * <p>这是完整参数版本，允许调用方同时控制请求超时、流式超时以及映射类型。
+     * 其业务主流程仍然复用现有的 {@link #executeChatConversation(String, String, Duration, Duration)}，
+     * 因此不会改变原本的发送、聚合、异常传播和超时处理语义。
+     *
+     * @param sessionKey 会话标识
+     * @param message 用户输入消息
+     * @param requestTimeout chat.send 请求超时时间
+     * @param streamTimeout 流式响应等待超时时间
+     * @param mappingType 原始事件映射类型
+     * @return 映射后的兼容事件对象列表
+     */
+    public CompletableFuture<List<TowerAppSseEvent>> sendChatRawEvents(
+            String sessionKey,
+            String message,
+            Duration requestTimeout,
+            Duration streamTimeout,
+            RawEventMappingType mappingType
+    ) {
+        Objects.requireNonNull(mappingType, "mappingType is required");
+        return executeChatConversation(sessionKey, message, requestTimeout, streamTimeout)
+                .thenApply(snapshot -> mapRawEvents(snapshot.rawEvents(), mappingType));
+    }
+
+    /**
      * 注册外部事件监听器。
      */
     public void setEventListener(Consumer<OpenClawMessage> listener) {
@@ -406,6 +477,207 @@ public final class OpenClawClient implements AutoCloseable {
         device.put("nonce", nonce);
         params.set("device", device);
         return params;
+    }
+
+    /**
+     * 按指定类型将原始事件列表映射为兼容事件对象。
+     *
+     * <p>这里作为统一入口，后续如果还要支持其他消费端协议，只需要继续在这里分发即可，
+     * 不需要改动聊天主流程。
+     */
+    private List<TowerAppSseEvent> mapRawEvents(List<String> rawEvents, RawEventMappingType mappingType) {
+        if (mappingType != RawEventMappingType.TOWER_APP) {
+            throw new IllegalArgumentException("Unsupported mapping type: " + mappingType);
+        }
+        return mapToTowerAppEvents(rawEvents);
+    }
+
+    /**
+     * 将 OpenClaw 原始事件列表映射为小塔 APP 兼容对象列表。
+     *
+     * <p>原始列表中会包含多种事件：握手事件、聊天生命周期事件、文本增量事件以及可能的错误事件。
+     * 这里只保留桌面协议真正需要消费的那几类，其余事件直接忽略，避免把无意义中间态暴露给调用方。
+     */
+    private List<TowerAppSseEvent> mapToTowerAppEvents(List<String> rawEvents) {
+        List<TowerAppSseEvent> mappedEvents = new ArrayList<TowerAppSseEvent>();
+        for (String rawEvent : rawEvents) {
+            // 每条原始报文独立映射，无法识别或不需要输出的事件直接跳过。
+            TowerAppSseEvent mappedEvent = mapToTowerAppEvent(rawEvent);
+            if (mappedEvent != null) {
+                mappedEvents.add(mappedEvent);
+            }
+        }
+        return mappedEvents;
+    }
+
+    /**
+     * 将单条 OpenClaw 原始事件映射为小塔 APP 兼容对象。
+     *
+     * <p>当前只处理 {@code type=event} 的消息，并继续区分 {@code agent} 与 {@code chat}
+     * 两类事件来源。这样可以最大程度贴合桌面文档中的消息语义，同时保留后续扩展空间。
+     */
+    private TowerAppSseEvent mapToTowerAppEvent(String rawEvent) {
+        try {
+            JsonNode root = objectMapper.readTree(rawEvent);
+            if (!"event".equalsIgnoreCase(root.path("type").asText(""))) {
+                return null;
+            }
+
+            String eventName = root.path("event").asText("");
+            JsonNode payload = root.path("payload");
+            if (payload.isMissingNode() || payload.isNull()) {
+                return null;
+            }
+
+            if ("agent".equals(eventName)) {
+                return mapAgentEventToTowerApp(payload);
+            }
+            if ("chat".equals(eventName)) {
+                return mapChatEventToTowerApp(payload);
+            }
+            return null;
+        } catch (IOException e) {
+            throw new IllegalStateException("Unable to map raw event to tower app format: " + rawEvent, e);
+        }
+    }
+
+    /**
+     * 映射 agent 事件，只使用 assistant.delta 与 lifecycle 事件。
+     *
+     * <p>这里故意只认三种桌面端真正需要的消息：
+     * start 映射为 {@code message} 空答案，
+     * assistant.delta 映射为 {@code message} 增量答案，
+     * end 映射为 {@code message_end}。
+     *
+     * <p>这样做的目的，是避免把 OpenClaw 侧更多内部流式状态直接透传给 APP，
+     * 否则很容易导致桌面端重复拼接文本或错误结束会话。
+     */
+    private TowerAppSseEvent mapAgentEventToTowerApp(JsonNode payload) throws IOException {
+        String stream = payload.path("stream").asText("");
+        JsonNode data = payload.path("data");
+
+        if ("assistant".equals(stream) && data != null && data.has("delta")) {
+            String delta = data.get("delta").asText("");
+            if (delta.isEmpty()) {
+                return null;
+            }
+            // assistant.delta 是桌面端真正需要消费的文本增量字段。
+            ObjectNode eventData = createTowerAppEventData("message", payload);
+            eventData.put("answer", delta);
+            return buildTowerAppSseEvent(eventData);
+        }
+
+        if ("lifecycle".equals(stream) && data != null) {
+            String phase = data.path("phase").asText("");
+            if ("start".equals(phase)) {
+                // start 事件需要先通知桌面端“消息开始了”，answer 明确给空字符串。
+                ObjectNode eventData = createTowerAppEventData("message", payload);
+                eventData.put("answer", "");
+                return buildTowerAppSseEvent(eventData);
+            }
+            if ("end".equals(phase)) {
+                // end 事件用于收尾；如果响应里附带检索资源，也一并透传到 metadata。
+                ObjectNode eventData = createTowerAppEventData("message_end", payload);
+                JsonNode retrieverResources = extractRetrieverResources(payload);
+                if (retrieverResources != null) {
+                    ObjectNode metadata = objectMapper.createObjectNode();
+                    metadata.set("retriever_resources", retrieverResources);
+                    eventData.set("metadata", metadata);
+                }
+                return buildTowerAppSseEvent(eventData);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * 映射 chat 事件，只处理 error，忽略 delta 以避免文本重复拼接。
+     *
+     * <p>根据当前原始协议表现，文本增量既可能出现在 {@code chat.state=delta}，
+     * 也可能出现在 {@code agent.stream=assistant.data.delta}。桌面文档要求只保留一种来源，
+     * 这里统一使用 agent.assistant.delta，避免同一段文本被重复转成两次 APP 消息。
+     */
+    private TowerAppSseEvent mapChatEventToTowerApp(JsonNode payload) throws IOException {
+        if (!"error".equals(payload.path("state").asText(""))) {
+            return null;
+        }
+
+        ObjectNode eventData = createTowerAppEventData("error", payload);
+        String errorMessage = extractChatErrorMessage(payload);
+        if (!isBlank(errorMessage)) {
+            eventData.put("message", errorMessage);
+        }
+        return buildTowerAppSseEvent(eventData);
+    }
+
+    /**
+     * 创建小塔 APP eventData 中的公共字段。
+     *
+     * <p>桌面对接文档里这些字段都来自同一份 OpenClaw 原始 payload：
+     * {@code conversation_id <- sessionKey}，
+     * {@code message_id/task_id/workflow_run_id <- runId}。
+     * 统一在这里组装，避免不同事件类型各自散落赋值。
+     */
+    private ObjectNode createTowerAppEventData(String event, JsonNode payload) {
+        ObjectNode eventData = objectMapper.createObjectNode();
+        String runId = payload.path("runId").asText("");
+        eventData.put("event", event);
+        eventData.put("conversation_id", payload.path("sessionKey").asText(""));
+        eventData.put("message_id", runId);
+        eventData.put("task_id", runId);
+        eventData.put("workflow_run_id", runId);
+        return eventData;
+    }
+
+    /**
+     * 构造符合小塔 APP 协议的外层事件对象。
+     *
+     * <p>注意这里会把内层 {@code eventData} 再序列化一次，确保字段类型是 JSON 字符串，
+     * 而不是直接嵌套对象；这正是桌面协议要求的格式。
+     */
+    private TowerAppSseEvent buildTowerAppSseEvent(ObjectNode eventData) throws IOException {
+        return new TowerAppSseEvent("TYPE_EVENT", objectMapper.writeValueAsString(eventData), "");
+    }
+
+    /**
+     * 提取 chat.error 事件中的错误描述。
+     *
+     * <p>不同错误报文里，错误文本可能挂在 {@code message} 或 {@code error} 字段上。
+     * 这里做一个兼容兜底，尽量把服务端原始错误信息原样保留下来，方便桌面端展示和排查。
+     */
+    private String extractChatErrorMessage(JsonNode payload) {
+        JsonNode messageNode = payload.get("message");
+        if (messageNode != null && !messageNode.isNull()) {
+            return messageNode.isValueNode() ? messageNode.asText("") : messageNode.toString();
+        }
+        JsonNode errorNode = payload.get("error");
+        if (errorNode != null && !errorNode.isNull()) {
+            return errorNode.isValueNode() ? errorNode.asText("") : errorNode.toString();
+        }
+        return "";
+    }
+
+    /**
+     * 在可能存在的几个位置上提取 retriever_resources。
+     *
+     * <p>不同响应链路里，检索资源元数据可能挂在 payload.metadata、payload.data.metadata
+     * 或 payload.data 下。这里按优先级逐一探测，只要命中一个就深拷贝返回，避免后续节点共享引用。
+     */
+    private JsonNode extractRetrieverResources(JsonNode payload) {
+        JsonNode node = payload.path("metadata").path("retriever_resources");
+        if (!node.isMissingNode() && !node.isNull()) {
+            return node.deepCopy();
+        }
+        node = payload.path("data").path("metadata").path("retriever_resources");
+        if (!node.isMissingNode() && !node.isNull()) {
+            return node.deepCopy();
+        }
+        node = payload.path("data").path("retriever_resources");
+        if (!node.isMissingNode() && !node.isNull()) {
+            return node.deepCopy();
+        }
+        return null;
     }
 
     // 确保 BouncyCastle Provider 只注册一次。
