@@ -5,212 +5,167 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import java.io.IOException;
-import java.net.http.HttpClient;
-import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
+import java.security.Provider;
 import java.security.PublicKey;
+import java.security.Security;
+import java.security.Signature;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
 /**
  * OpenClaw Java SDK 客户端。
+ *
+ * <p>该实现为了兼容 JDK 8，底层 WebSocket 改为基于 OkHttp，
+ * 对外暴露的方法签名和业务语义保持不变。</p>
  */
 public final class OpenClawClient implements AutoCloseable {
     // 协议版本固定为 OpenClaw v3。
     private static final int PROTOCOL_VERSION = 3;
-    // 默认会话键用于未传入 sessionKey 的场景。
+    // 默认会话键，用于未显式传入 sessionKey 的场景。
     private static final String DEFAULT_SESSION_KEY = "main";
-    // 默认请求超时时间用于等待 req/res 响应。
+    // chat.send 请求阶段默认超时时间。
     private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
-    // 默认流式超时时间用于等待一次完整对话结束。
+    // 流式回复阶段默认超时时间。
     private static final Duration DEFAULT_STREAM_TIMEOUT = Duration.ofSeconds(180);
-    // 握手时上报的客户端标识。
+    // 握手时上报的客户端标识信息。
     private static final String DEFAULT_CLIENT_ID = "openclaw-tui";
-    // 握手时上报的客户端模式。
     private static final String DEFAULT_CLIENT_MODE = "ui";
-    // 握手时上报的客户端角色。
     private static final String DEFAULT_ROLE = "operator";
-    // 握手时上报的平台信息。
     private static final String DEFAULT_PLATFORM = "java";
-    // 握手时上报的设备类型。
     private static final String DEFAULT_DEVICE_FAMILY = "desktop";
-    // HTTP 请求和握手参数中复用的用户代理字符串。
     private static final String DEFAULT_USER_AGENT = "openclaw-java-sdk-demo/1.0";
-    // Ed25519 公钥的 SPKI 前缀用于提取 raw public key。
+    // Ed25519 公钥的 SPKI 前缀，用于提取 32 字节 raw public key。
     private static final byte[] ED25519_SPKI_PREFIX = hex("302a300506032b6570032100");
+    // 通过 BouncyCastle 提供 JDK 8 下的 Ed25519 支持。
+    private static final Provider BC_PROVIDER = ensureBcProvider();
+    // 统一调度 CompletableFuture 超时任务。
+    private static final ScheduledExecutorService TIMEOUT_EXECUTOR =
+            Executors.newSingleThreadScheduledExecutor(newDaemonThreadFactory("openclaw-timeout"));
 
-    // 保存 SDK 配置对象。
+    // 保存 SDK 配置。
     private final OpenClawConfig config;
     // 保存 JSON 序列化组件。
     private final ObjectMapper objectMapper;
-    // 保存底层 HTTP/WebSocket 客户端。
-    private final HttpClient httpClient;
+    // 保存底层 OkHttp 客户端。
+    private final OkHttpClient httpClient;
     // 保存设备身份使用的密钥对。
     private final KeyPair deviceKeyPair;
-    // 保存设备唯一标识。
+    // 保存设备 ID。
     private final String deviceId;
     // 保存 raw public key 的 base64url 字符串。
     private final String publicKeyRawBase64Url;
     // 保存待响应请求映射。
-    private final Map<String, PendingRequest> pendingRequests = new ConcurrentHashMap<>();
-    // 保存按 runId 聚合中的对话映射。
-    private final Map<String, ChatConversation> conversations = new ConcurrentHashMap<>();
-    // 保存逻辑握手完成信号。
-    private final CompletableFuture<Void> connected = new CompletableFuture<>();
+    private final Map<String, PendingRequest> pendingRequests = new ConcurrentHashMap<String, PendingRequest>();
+    // 保存按 runId 聚合中的对话上下文。
+    private final Map<String, ChatConversation> conversations = new ConcurrentHashMap<String, ChatConversation>();
+    // 保存握手完成信号。
+    private final CompletableFuture<Void> connected = new CompletableFuture<Void>();
     // 保存当前 WebSocket 连接。
     private volatile WebSocket webSocket;
     // 保存外部注册的事件监听器。
     private volatile Consumer<OpenClawMessage> eventListener;
 
     /**
-     * 使用配置创建客户端。
+     * 使用配置对象创建客户端。
      *
      * @param config SDK 配置
      */
     public OpenClawClient(OpenClawConfig config) {
-        // 保存配置对象。
         this.config = Objects.requireNonNull(config, "config is required");
-        // 初始化 JSON 处理器。
         this.objectMapper = new ObjectMapper();
-        // 初始化底层 HTTP 客户端。
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(config.connectTimeout())
+        // JDK 8 下使用 OkHttp 负责 WebSocket 建连与收发。
+        this.httpClient = new OkHttpClient.Builder()
+                .connectTimeout(config.connectTimeout().toMillis(), TimeUnit.MILLISECONDS)
+                .readTimeout(0, TimeUnit.MILLISECONDS)
                 .build();
-        // 生成设备密钥对。
         this.deviceKeyPair = generateDeviceKeyPair();
-        // 提取原始公钥。
         byte[] publicKeyRaw = extractEd25519RawPublicKey(deviceKeyPair.getPublic());
-        // 计算设备标识。
         this.deviceId = sha256Hex(publicKeyRaw);
-        // 编码原始公钥。
         this.publicKeyRawBase64Url = base64Url(publicKeyRaw);
     }
 
     /**
      * 使用网关地址创建客户端。
-     *
-     * @param gatewayUri 网关地址
      */
     public OpenClawClient(String gatewayUri) {
-        // 使用默认配置创建客户端。
         this(OpenClawConfig.of(gatewayUri));
     }
 
     /**
-     * 使用网关地址和令牌创建客户端。
-     *
-     * @param gatewayUri 网关地址
-     * @param authToken 鉴权令牌
+     * 使用网关地址和鉴权 token 创建客户端。
      */
     public OpenClawClient(String gatewayUri, String authToken) {
-        // 使用网关地址和令牌创建客户端。
         this(OpenClawConfig.of(gatewayUri, authToken));
     }
 
     /**
-     * 使用网关地址和连接超时时间创建客户端。
-     *
-     * @param gatewayUri 网关地址
-     * @param connectTimeout 连接超时时间
+     * 使用网关地址和连接超时创建客户端。
      */
     public OpenClawClient(String gatewayUri, Duration connectTimeout) {
-        // 使用网关地址和连接超时时间创建客户端。
         this(OpenClawConfig.of(gatewayUri, connectTimeout));
     }
 
     /**
      * 使用完整连接参数创建客户端。
-     *
-     * @param gatewayUri 网关地址
-     * @param authToken 鉴权令牌
-     * @param connectTimeout 连接超时时间
      */
     public OpenClawClient(String gatewayUri, String authToken, Duration connectTimeout) {
-        // 使用完整连接参数创建客户端。
         this(OpenClawConfig.of(gatewayUri, authToken, connectTimeout));
     }
 
     /**
      * 初始化并连接客户端。
-     *
-     * @param config SDK 配置
-     * @return 已完成连接的客户端
      */
     public static CompletableFuture<OpenClawClient> init(OpenClawConfig config) {
-        // 创建客户端实例。
-        OpenClawClient client = new OpenClawClient(config);
-        // 建立连接成功后返回客户端实例。
-        return client.connect()
-                .thenApply(ignored -> client)
-                .whenComplete((readyClient, error) -> {
-                    // 初始化失败时关闭已创建的客户端。
-                    if (error != null) {
-                        client.close();
-                    }
-                });
+        final OpenClawClient client = new OpenClawClient(config);
+        return client.connect().thenApply(ignored -> client).whenComplete((readyClient, error) -> {
+            if (error != null) {
+                client.close();
+            }
+        });
     }
 
-    /**
-     * 使用网关地址初始化并连接客户端。
-     *
-     * @param gatewayUri 网关地址
-     * @return 已完成连接的客户端
-     */
     public static CompletableFuture<OpenClawClient> init(String gatewayUri) {
-        // 使用网关地址完成初始化。
         return init(OpenClawConfig.of(gatewayUri));
     }
 
-    /**
-     * 使用网关地址和令牌初始化并连接客户端。
-     *
-     * @param gatewayUri 网关地址
-     * @param authToken 鉴权令牌
-     * @return 已完成连接的客户端
-     */
     public static CompletableFuture<OpenClawClient> init(String gatewayUri, String authToken) {
-        // 使用网关地址和令牌完成初始化。
         return init(OpenClawConfig.of(gatewayUri, authToken));
     }
 
-    /**
-     * 使用网关地址和连接超时时间初始化并连接客户端。
-     *
-     * @param gatewayUri 网关地址
-     * @param connectTimeout 连接超时时间
-     * @return 已完成连接的客户端
-     */
     public static CompletableFuture<OpenClawClient> init(String gatewayUri, Duration connectTimeout) {
-        // 使用网关地址和超时时间完成初始化。
         return init(OpenClawConfig.of(gatewayUri, connectTimeout));
     }
 
-    /**
-     * 使用完整参数初始化并连接客户端。
-     *
-     * @param gatewayUri 网关地址
-     * @param authToken 鉴权令牌
-     * @param connectTimeout 连接超时时间
-     * @return 已完成连接的客户端
-     */
     public static CompletableFuture<OpenClawClient> init(String gatewayUri, String authToken, Duration connectTimeout) {
-        // 使用完整连接参数完成初始化。
         return init(OpenClawConfig.of(gatewayUri, authToken, connectTimeout));
     }
 
@@ -220,43 +175,32 @@ public final class OpenClawClient implements AutoCloseable {
      * @return 握手完成信号
      */
     public CompletableFuture<Void> connect() {
-        // 创建 WebSocket 构建器。
-        WebSocket.Builder builder = httpClient.newWebSocketBuilder()
-                .connectTimeout(config.connectTimeout())
-                .header("User-Agent", DEFAULT_USER_AGENT);
-
-        // 已配置令牌时补充 Authorization 头。
-        if (config.authToken() != null && !config.authToken().isBlank()) {
-            // 按网关要求编码 token。
+        Request.Builder builder = new Request.Builder()
+                .url(config.gatewayUri().toString())
+                .addHeader("User-Agent", DEFAULT_USER_AGENT);
+        if (hasText(config.authToken())) {
             String encoded = Base64.getEncoder()
                     .encodeToString(("token:" + config.authToken()).getBytes(StandardCharsets.UTF_8));
-            // 写入 Authorization 请求头。
-            builder.header("Authorization", "Basic " + encoded);
+            builder.addHeader("Authorization", "Basic " + encoded);
         }
-
-        // 建立物理连接并等待逻辑握手完成。
-        return builder.buildAsync(config.gatewayUri(), new Listener())
-                .thenAccept(ws -> this.webSocket = ws)
-                .thenCompose(ignored -> connected);
+        webSocket = httpClient.newWebSocket(builder.build(), new Listener());
+        return connected;
     }
 
     /**
-     * 发送底层协议调用。
+     * 发送底层协议请求。
      *
      * @param method 方法名
      * @param params 请求参数
-     * @param timeout 请求超时时间
+     * @param timeout 超时时间
      * @return 原始响应消息
      */
     public CompletableFuture<OpenClawMessage> call(String method, JsonNode params, Duration timeout) {
-        // 校验连接是否已经建立。
         if (webSocket == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("WebSocket is not connected"));
+            return failedFuture(new IllegalStateException("WebSocket is not connected"));
         }
 
-        // 生成本次请求的唯一 id。
         String requestId = UUID.randomUUID().toString();
-        // 组装请求报文。
         ObjectNode request = objectMapper.createObjectNode();
         request.put("type", "req");
         request.put("id", requestId);
@@ -265,74 +209,48 @@ public final class OpenClawClient implements AutoCloseable {
             request.set("params", params);
         }
 
-        // 创建等待响应的 Future。
-        CompletableFuture<OpenClawMessage> responseFuture = new CompletableFuture<>();
-        // 保存请求方法和 Future 的映射关系。
+        CompletableFuture<OpenClawMessage> responseFuture = new CompletableFuture<OpenClawMessage>();
         PendingRequest pendingRequest = new PendingRequest(method, responseFuture);
         pendingRequests.put(requestId, pendingRequest);
-        // 请求完成后移除映射关系。
         responseFuture.whenComplete((message, error) -> pendingRequests.remove(requestId, pendingRequest));
 
-        final String text;
+        final String requestText;
         try {
-            // 序列化请求报文。
-            text = objectMapper.writeValueAsString(request);
+            requestText = objectMapper.writeValueAsString(request);
         } catch (IOException e) {
-            // 序列化失败时清理待响应映射。
             pendingRequests.remove(requestId, pendingRequest);
-            return CompletableFuture.failedFuture(e);
+            return failedFuture(e);
         }
 
-        // 发送请求文本。
-        webSocket.sendText(text, true)
-                .whenComplete((ignored, error) -> {
-                    // 发送失败时直接结束本次调用。
-                    if (error != null) {
-                        pendingRequests.remove(requestId, pendingRequest);
-                        responseFuture.completeExceptionally(error);
-                    }
-                });
+        if (!webSocket.send(requestText)) {
+            pendingRequests.remove(requestId, pendingRequest);
+            responseFuture.completeExceptionally(new IllegalStateException("WebSocket send failed"));
+            return responseFuture;
+        }
 
-        // 计算实际超时时间。
         Duration effective = timeout == null ? DEFAULT_REQUEST_TIMEOUT : timeout;
-        return responseFuture.orTimeout(effective.toMillis(), TimeUnit.MILLISECONDS);
+        return applyTimeout(responseFuture, effective, "OpenClaw request");
     }
 
     /**
-     * 发送 chat.send 并返回原始响应消息。
-     *
-     * @param message 用户消息
-     * @return 原始响应消息
+     * 使用默认会话发送 chat.send 请求。
      */
     public CompletableFuture<OpenClawMessage> sendChat(String message) {
-        // 使用默认会话键发送聊天请求。
         return sendChat(DEFAULT_SESSION_KEY, message, DEFAULT_REQUEST_TIMEOUT);
     }
 
     /**
-     * 发送 chat.send 并返回原始响应消息。
-     *
-     * @param sessionKey 会话键
-     * @param message 用户消息
-     * @return 原始响应消息
+     * 发送 chat.send 请求并返回原始响应。
      */
     public CompletableFuture<OpenClawMessage> sendChat(String sessionKey, String message) {
-        // 使用默认请求超时时间发送聊天请求。
         return sendChat(sessionKey, message, DEFAULT_REQUEST_TIMEOUT);
     }
 
     /**
-     * 发送 chat.send 并返回原始响应消息。
-     *
-     * @param sessionKey 会话键
-     * @param message 用户消息
-     * @param timeout 请求超时时间
-     * @return 原始响应消息
+     * 发送 chat.send 请求并返回原始响应。
      */
     public CompletableFuture<OpenClawMessage> sendChat(String sessionKey, String message, Duration timeout) {
-        // 校验消息内容不能为空。
         Objects.requireNonNull(message, "message is required");
-        // 组装 chat.send 参数。
         ObjectNode params = objectMapper.createObjectNode();
         params.put("sessionKey", normalizeSessionKey(sessionKey));
         params.put("message", message);
@@ -341,79 +259,43 @@ public final class OpenClawClient implements AutoCloseable {
     }
 
     /**
-     * 发送聊天请求并返回拼接后的正常消息内容。
-     *
-     * @param message 用户消息
-     * @return 完整回复文本
+     * 发送聊天请求并返回聚合后的最终文本。
      */
     public CompletableFuture<String> sendChatText(String message) {
-        // 使用默认会话键和默认超时时间获取完整回复。
         return sendChatText(DEFAULT_SESSION_KEY, message, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_TIMEOUT);
     }
 
     /**
-     * 发送聊天请求并返回拼接后的正常消息内容。
-     *
-     * @param sessionKey 会话键
-     * @param message 用户消息
-     * @return 完整回复文本
+     * 发送聊天请求并返回聚合后的最终文本。
      */
     public CompletableFuture<String> sendChatText(String sessionKey, String message) {
-        // 使用指定会话键和默认超时时间获取完整回复。
         return sendChatText(sessionKey, message, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_TIMEOUT);
     }
 
     /**
-     * 发送聊天请求并返回拼接后的正常消息内容。
-     *
-     * @param sessionKey 会话键
-     * @param message 用户消息
-     * @param requestTimeout 请求超时时间
-     * @param streamTimeout 流式超时时间
-     * @return 完整回复文本
+     * 发送聊天请求并返回聚合后的最终文本。
      */
-    public CompletableFuture<String> sendChatText(
-            String sessionKey,
-            String message,
-            Duration requestTimeout,
-            Duration streamTimeout
-    ) {
-        // 执行完整对话采集流程并提取最终文本。
+    public CompletableFuture<String> sendChatText(String sessionKey, String message, Duration requestTimeout, Duration streamTimeout) {
         return executeChatConversation(sessionKey, message, requestTimeout, streamTimeout)
                 .thenApply(ChatConversationSnapshot::assistantContent);
     }
 
     /**
-     * 发送聊天请求并返回原始 event 消息体集合。
-     *
-     * @param message 用户消息
-     * @return 原始 event 消息体集合
+     * 发送聊天请求并返回完整原始事件列表。
      */
     public CompletableFuture<List<String>> sendChatRawEvents(String message) {
-        // 使用默认会话键和默认超时时间获取原始事件。
         return sendChatRawEvents(DEFAULT_SESSION_KEY, message, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_TIMEOUT);
     }
 
     /**
-     * 发送聊天请求并返回原始 event 消息体集合。
-     *
-     * @param sessionKey 会话键
-     * @param message 用户消息
-     * @return 原始 event 消息体集合
+     * 发送聊天请求并返回完整原始事件列表。
      */
     public CompletableFuture<List<String>> sendChatRawEvents(String sessionKey, String message) {
-        // 使用指定会话键和默认超时时间获取原始事件。
         return sendChatRawEvents(sessionKey, message, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_TIMEOUT);
     }
 
     /**
-     * 发送聊天请求并返回原始 event 消息体集合。
-     *
-     * @param sessionKey 会话键
-     * @param message 用户消息
-     * @param requestTimeout 请求超时时间
-     * @param streamTimeout 流式超时时间
-     * @return 原始 event 消息体集合
+     * 发送聊天请求并返回完整原始事件列表。
      */
     public CompletableFuture<List<String>> sendChatRawEvents(
             String sessionKey,
@@ -421,80 +303,65 @@ public final class OpenClawClient implements AutoCloseable {
             Duration requestTimeout,
             Duration streamTimeout
     ) {
-        // 执行完整对话采集流程并提取原始事件列表。
         return executeChatConversation(sessionKey, message, requestTimeout, streamTimeout)
                 .thenApply(ChatConversationSnapshot::rawEvents);
     }
 
     /**
      * 注册外部事件监听器。
-     *
-     * @param listener 事件监听器
      */
     public void setEventListener(Consumer<OpenClawMessage> listener) {
-        // 保存外部事件监听器。
         this.eventListener = listener;
     }
 
     /**
-     * 关闭客户端连接。
+     * 关闭当前连接。
      */
     @Override
     public void close() {
-        // 读取当前连接引用。
-        WebSocket ws = this.webSocket;
+        WebSocket ws = webSocket;
         if (ws != null) {
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "bye");
+            ws.close(1000, "bye");
         }
     }
 
-    // 执行一次完整对话并返回聚合结果。
+    /**
+     * 执行一次完整对话，先拿到 runId，再等待流式事件完成聚合。
+     */
     private CompletableFuture<ChatConversationSnapshot> executeChatConversation(
             String sessionKey,
             String message,
             Duration requestTimeout,
             Duration streamTimeout
     ) {
-        // 计算请求阶段的实际超时时间。
-        Duration effectiveRequestTimeout = requestTimeout == null ? DEFAULT_REQUEST_TIMEOUT : requestTimeout;
-        // 计算流式阶段的实际超时时间。
-        Duration effectiveStreamTimeout = streamTimeout == null ? DEFAULT_STREAM_TIMEOUT : streamTimeout;
+        final Duration effectiveRequestTimeout = requestTimeout == null ? DEFAULT_REQUEST_TIMEOUT : requestTimeout;
+        final Duration effectiveStreamTimeout = streamTimeout == null ? DEFAULT_STREAM_TIMEOUT : streamTimeout;
 
-        // 先发送 chat.send 请求。
-        return sendChat(sessionKey, message, effectiveRequestTimeout)
-                .thenCompose(response -> {
-                    // 响应明确失败时直接抛出异常。
-                    if (!Boolean.TRUE.equals(response.ok())) {
-                        return CompletableFuture.failedFuture(
-                                new IllegalStateException("chat.send rejected: " + describeJson(response.error()))
-                        );
-                    }
+        return sendChat(sessionKey, message, effectiveRequestTimeout).thenCompose(response -> {
+            if (!Boolean.TRUE.equals(response.ok())) {
+                return failedFuture(new IllegalStateException("chat.send rejected: " + describeJson(response.error())));
+            }
 
-                    // 提取当前对话的 runId。
-                    String runId = response.payload() == null ? null : response.payload().path("runId").asText(null);
-                    if (runId == null || runId.isBlank()) {
-                        return CompletableFuture.failedFuture(
-                                new IllegalStateException("chat.send response does not contain runId")
-                        );
-                    }
+            String runId = response.payload() == null ? null : response.payload().path("runId").asText(null);
+            if (isBlank(runId)) {
+                return failedFuture(new IllegalStateException("chat.send response does not contain runId"));
+            }
 
-                    // 取出或创建 runId 对应的对话收集器。
-                    ChatConversation conversation = conversations.computeIfAbsent(runId, ChatConversation::new);
-                    // 等待流式结束后生成结果快照，并在结束后移除缓存。
-                    return conversation.await(effectiveStreamTimeout)
-                            .thenApply(ignored -> conversation.snapshot())
-                            .whenComplete((snapshot, error) -> conversations.remove(runId, conversation));
-                });
+            final ChatConversation conversation = conversations.computeIfAbsent(runId, ChatConversation::new);
+            return conversation.await(effectiveStreamTimeout)
+                    .thenApply(ignored -> conversation.snapshot())
+                    .whenComplete((snapshot, error) -> conversations.remove(conversation.runId(), conversation));
+        });
     }
 
-    // 组装 connect 方法需要的参数。
+    /**
+     * 组装 connect 请求所需参数。
+     */
     private ObjectNode buildConnectParams(String nonce) {
-        // 创建 connect 参数节点。
         ObjectNode params = objectMapper.createObjectNode();
         params.put("minProtocol", PROTOCOL_VERSION);
         params.put("maxProtocol", PROTOCOL_VERSION);
 
-        // 组装 client 节点。
         ObjectNode client = objectMapper.createObjectNode();
         client.put("id", DEFAULT_CLIENT_ID);
         client.put("displayName", "openclaw java sdk demo");
@@ -505,73 +372,64 @@ public final class OpenClawClient implements AutoCloseable {
         client.put("instanceId", UUID.randomUUID().toString());
         params.set("client", client);
 
-        // 写入通用参数。
         params.put("locale", "zh-CN");
         params.put("userAgent", DEFAULT_USER_AGENT);
         params.put("role", DEFAULT_ROLE);
 
-        // 写入权限范围。
         ArrayNode scopes = objectMapper.createArrayNode();
         scopes.add("operator.read");
         scopes.add("operator.write");
         params.set("scopes", scopes);
 
-        // 写入空的能力占位节点。
         params.set("caps", objectMapper.createArrayNode());
         params.set("commands", objectMapper.createArrayNode());
         params.set("permissions", objectMapper.createObjectNode());
 
-        // 配置了令牌时补充 auth 节点。
-        if (config.authToken() != null && !config.authToken().isBlank()) {
+        if (hasText(config.authToken())) {
             ObjectNode auth = objectMapper.createObjectNode();
             auth.put("token", config.authToken());
             params.set("auth", auth);
         }
 
-        // 计算签名时间。
         long signedAt = System.currentTimeMillis();
-        // 组装设备签名载荷。
         String signaturePayload = String.join("|",
-                "v3",
-                deviceId,
-                DEFAULT_CLIENT_ID,
-                DEFAULT_CLIENT_MODE,
-                DEFAULT_ROLE,
-                "operator.read,operator.write",
-                String.valueOf(signedAt),
+                "v3", deviceId, DEFAULT_CLIENT_ID, DEFAULT_CLIENT_MODE, DEFAULT_ROLE,
+                "operator.read,operator.write", String.valueOf(signedAt),
                 config.authToken() == null ? "" : config.authToken(),
-                nonce,
-                DEFAULT_PLATFORM,
-                DEFAULT_DEVICE_FAMILY);
-        // 使用设备私钥进行签名。
-        String signature = signBase64Url(deviceKeyPair.getPrivate(), signaturePayload);
+                nonce, DEFAULT_PLATFORM, DEFAULT_DEVICE_FAMILY);
 
-        // 写入设备身份节点。
         ObjectNode device = objectMapper.createObjectNode();
         device.put("id", deviceId);
         device.put("publicKey", publicKeyRawBase64Url);
-        device.put("signature", signature);
+        device.put("signature", signBase64Url(deviceKeyPair.getPrivate(), signaturePayload));
         device.put("signedAt", signedAt);
         device.put("nonce", nonce);
         params.set("device", device);
         return params;
     }
 
-    // 生成 Ed25519 设备密钥对。
+    // 确保 BouncyCastle Provider 只注册一次。
+    private static Provider ensureBcProvider() {
+        Provider provider = Security.getProvider(BouncyCastleProvider.PROVIDER_NAME);
+        if (provider != null) {
+            return provider;
+        }
+        BouncyCastleProvider newProvider = new BouncyCastleProvider();
+        Security.addProvider(newProvider);
+        return newProvider;
+    }
+
+    // 生成用于设备身份的 Ed25519 密钥对。
     private static KeyPair generateDeviceKeyPair() {
         try {
-            // 获取 Ed25519 密钥生成器。
-            KeyPairGenerator generator = KeyPairGenerator.getInstance("Ed25519");
-            // 生成并返回密钥对。
-            return generator.generateKeyPair();
+            return KeyPairGenerator.getInstance("Ed25519", BC_PROVIDER).generateKeyPair();
         } catch (Exception e) {
             throw new IllegalStateException("Unable to generate device key pair", e);
         }
     }
 
-    // 提取 Ed25519 原始公钥字节。
+    // 从 SPKI 编码中提取 32 字节原始公钥。
     private static byte[] extractEd25519RawPublicKey(PublicKey publicKey) {
-        // 读取公钥编码内容。
         byte[] encoded = publicKey.getEncoded();
         if (encoded.length == ED25519_SPKI_PREFIX.length + 32) {
             boolean matches = true;
@@ -587,14 +445,13 @@ public final class OpenClawClient implements AutoCloseable {
                 return raw;
             }
         }
-        // 编码结构不匹配时回退返回完整编码。
         return encoded;
     }
 
-    // 对载荷执行 Ed25519 签名并返回 base64url 字符串。
+    // 对设备签名载荷做 Ed25519 签名，并转为 base64url。
     private static String signBase64Url(PrivateKey privateKey, String payload) {
         try {
-            java.security.Signature signer = java.security.Signature.getInstance("Ed25519");
+            Signature signer = Signature.getInstance("Ed25519", BC_PROVIDER);
             signer.initSign(privateKey);
             signer.update(payload.getBytes(StandardCharsets.UTF_8));
             return base64Url(signer.sign());
@@ -608,8 +465,8 @@ public final class OpenClawClient implements AutoCloseable {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256").digest(input);
             StringBuilder sb = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
+            for (byte value : digest) {
+                sb.append(String.format("%02x", value));
             }
             return sb.toString();
         } catch (Exception e) {
@@ -617,12 +474,12 @@ public final class OpenClawClient implements AutoCloseable {
         }
     }
 
-    // 将字节数组编码成不带补位的 base64url 字符串。
+    // 将字节数组编码为不带补位的 base64url。
     private static String base64Url(byte[] bytes) {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 
-    // 将十六进制字符串转换成字节数组。
+    // 将十六进制字符串转换为字节数组。
     private static byte[] hex(String hex) {
         int len = hex.length();
         byte[] out = new byte[len / 2];
@@ -632,12 +489,22 @@ public final class OpenClawClient implements AutoCloseable {
         return out;
     }
 
-    // 规范化会话键。
+    // 规范化会话键，空值时回退默认会话。
     private static String normalizeSessionKey(String sessionKey) {
-        return sessionKey == null || sessionKey.isBlank() ? DEFAULT_SESSION_KEY : sessionKey;
+        return isBlank(sessionKey) ? DEFAULT_SESSION_KEY : sessionKey;
     }
 
-    // 安全读取 JSON 文本字段。
+    // 判断字符串是否包含有效文本。
+    private static boolean hasText(String value) {
+        return !isBlank(value);
+    }
+
+    // JDK 8 兼容版的空白判断。
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    // 安全读取 JsonNode 中的文本字段。
     private static String text(JsonNode node, String key) {
         if (node == null || key == null || !node.has(key) || node.get(key).isNull()) {
             return "";
@@ -645,24 +512,59 @@ public final class OpenClawClient implements AutoCloseable {
         return node.get(key).asText("");
     }
 
-    // 将 JsonNode 转换成可读错误文本。
+    // 将 JsonNode 转为便于排障的字符串。
     private static String describeJson(JsonNode node) {
         return node == null || node.isNull() ? "unknown error" : node.toString();
     }
 
-    // 将所有待响应请求统一置为失败。
+    // JDK 8 兼容版的 CompletableFuture.failedFuture。
+    private static <T> CompletableFuture<T> failedFuture(Throwable error) {
+        CompletableFuture<T> future = new CompletableFuture<T>();
+        future.completeExceptionally(error);
+        return future;
+    }
+
+    // JDK 8 兼容版的 CompletableFuture 超时包装。
+    private static <T> CompletableFuture<T> applyTimeout(final CompletableFuture<T> future, Duration timeout, String operation) {
+        if (timeout == null) {
+            return future;
+        }
+        final long timeoutMillis = timeout.toMillis();
+        final ScheduledFuture<?> timeoutTask = TIMEOUT_EXECUTOR.schedule(
+                () -> future.completeExceptionally(new TimeoutException(operation + " timed out after " + timeoutMillis + " ms")),
+                timeoutMillis,
+                TimeUnit.MILLISECONDS
+        );
+        future.whenComplete((result, error) -> timeoutTask.cancel(false));
+        return future;
+    }
+
+    // 创建守护线程工厂，避免后台超时线程阻塞进程退出。
+    private static ThreadFactory newDaemonThreadFactory(final String threadName) {
+        return runnable -> {
+            Thread thread = new Thread(runnable, threadName);
+            thread.setDaemon(true);
+            return thread;
+        };
+    }
+
+    // 统一结束所有待响应请求。
     private void failPendingRequests(Throwable error) {
-        pendingRequests.values().forEach(request -> request.future().completeExceptionally(error));
+        for (PendingRequest request : pendingRequests.values()) {
+            request.future().completeExceptionally(error);
+        }
         pendingRequests.clear();
     }
 
-    // 将所有聚合中的对话统一置为失败。
+    // 统一结束所有聚合中的对话。
     private void failActiveConversations(Throwable error) {
-        conversations.values().forEach(conversation -> conversation.fail(error));
+        for (ChatConversation conversation : conversations.values()) {
+            conversation.fail(error);
+        }
         conversations.clear();
     }
 
-    // 将对话相关 event 报文分发给对应 runId 的收集器。
+    // 将 agent/chat 事件投递给对应 runId 的对话收集器。
     private void handleConversationEvent(OpenClawMessage message, String rawMessage) {
         if (!"event".equalsIgnoreCase(message.type()) || message.payload() == null) {
             return;
@@ -672,86 +574,61 @@ public final class OpenClawClient implements AutoCloseable {
             return;
         }
         String runId = text(message.payload(), "runId");
-        if (runId.isBlank()) {
+        if (isBlank(runId)) {
             return;
         }
         conversations.computeIfAbsent(runId, ChatConversation::new).accept(message, rawMessage);
     }
 
-    // WebSocket 文本消息监听器。
-    private final class Listener implements WebSocket.Listener {
-        // 保存分片文本，last=true 时统一解析。
-        private final StringBuilder buffer = new StringBuilder();
-
+    // OkHttp WebSocket 监听器，负责驱动握手与消息分发。
+    private final class Listener extends WebSocketListener {
         @Override
-        public void onOpen(WebSocket webSocket) {
-            WebSocket.Listener.super.onOpen(webSocket);
-            webSocket.request(1);
+        public void onMessage(WebSocket webSocket, String text) {
+            handleIncoming(text);
         }
 
         @Override
-        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-            // 追加当前文本分片。
-            buffer.append(data);
-            if (last) {
-                // 读取完整报文并清空缓冲区。
-                String messageText = buffer.toString();
-                buffer.setLength(0);
-                // 处理完整报文。
-                handleIncoming(messageText);
-            }
-            webSocket.request(1);
-            return CompletableFuture.completedFuture(null);
+        public void onMessage(WebSocket webSocket, ByteString bytes) {
+            handleIncoming(bytes.utf8());
         }
 
         @Override
-        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            // 构造统一关闭异常。
-            IllegalStateException closed = new IllegalStateException(
-                    "OpenClaw WebSocket closed: " + statusCode + " " + reason
-            );
+        public void onClosed(WebSocket webSocket, int code, String reason) {
+            IllegalStateException closed = new IllegalStateException("OpenClaw WebSocket closed: " + code + " " + reason);
             failPendingRequests(closed);
             failActiveConversations(closed);
             connected.completeExceptionally(closed);
-            return WebSocket.Listener.super.onClose(webSocket, statusCode, reason);
         }
 
         @Override
-        public void onError(WebSocket webSocket, Throwable error) {
+        public void onFailure(WebSocket webSocket, Throwable error, Response response) {
             failPendingRequests(error);
             failActiveConversations(error);
             connected.completeExceptionally(error);
-            WebSocket.Listener.super.onError(webSocket, error);
         }
 
-        // 处理完整文本报文。
+        // 解析单条完整报文，并分发到请求等待器或事件监听器。
         private void handleIncoming(String messageText) {
             try {
-                // 反序列化统一消息对象。
                 OpenClawMessage message = objectMapper.readValue(messageText, OpenClawMessage.class);
-                // 对话事件先交给内部聚合器处理。
                 handleConversationEvent(message, messageText);
 
-                // 收到 connect.challenge 时立即回发 connect 完成逻辑握手。
                 if ("event".equalsIgnoreCase(message.type())
                         && "connect.challenge".equalsIgnoreCase(message.event())
                         && message.payload() != null
                         && message.payload().hasNonNull("nonce")) {
                     String nonce = message.payload().get("nonce").asText();
-                    call("connect", buildConnectParams(nonce), Duration.ofSeconds(15))
-                            .whenComplete((res, err) -> {
-                                if (err != null) {
-                                    connected.completeExceptionally(err);
-                                    return;
-                                }
-                                if (Boolean.TRUE.equals(res.ok())) {
-                                    connected.complete(null);
-                                } else {
-                                    connected.completeExceptionally(
-                                            new IllegalStateException("connect rejected: " + describeJson(res.error()))
-                                    );
-                                }
-                            });
+                    call("connect", buildConnectParams(nonce), Duration.ofSeconds(15)).whenComplete((res, err) -> {
+                        if (err != null) {
+                            connected.completeExceptionally(err);
+                        } else if (Boolean.TRUE.equals(res.ok())) {
+                            connected.complete(null);
+                        } else {
+                            connected.completeExceptionally(
+                                    new IllegalStateException("connect rejected: " + describeJson(res.error()))
+                            );
+                        }
+                    });
                     Consumer<OpenClawMessage> listener = eventListener;
                     if (listener != null) {
                         listener.accept(message);
@@ -759,7 +636,6 @@ public final class OpenClawClient implements AutoCloseable {
                     return;
                 }
 
-                // 收到响应报文时按请求 id 回填等待中的 Future。
                 if ("res".equalsIgnoreCase(message.type()) && message.id() != null) {
                     PendingRequest pending = pendingRequests.remove(message.id());
                     if (pending != null) {
@@ -773,7 +649,6 @@ public final class OpenClawClient implements AutoCloseable {
                     }
                 }
 
-                // 其余消息透出给外部监听器。
                 Consumer<OpenClawMessage> listener = eventListener;
                 if (listener != null) {
                     listener.accept(message);
@@ -781,9 +656,7 @@ public final class OpenClawClient implements AutoCloseable {
             } catch (Exception ex) {
                 Consumer<OpenClawMessage> listener = eventListener;
                 if (listener != null) {
-                    JsonNode payload = objectMapper.createObjectNode()
-                            .put("raw", messageText)
-                            .put("error", ex.getMessage());
+                    JsonNode payload = objectMapper.createObjectNode().put("raw", messageText).put("error", ex.getMessage());
                     listener.accept(new OpenClawMessage("parse_error", null, null, null, null, payload, null));
                 }
                 if (!connected.isDone()) {
@@ -793,28 +666,38 @@ public final class OpenClawClient implements AutoCloseable {
         }
     }
 
-    // 保存待响应请求信息。
-    private record PendingRequest(String method, CompletableFuture<OpenClawMessage> future) {
+    // 保存单次底层请求的等待上下文。
+    private static final class PendingRequest {
+        private final String method;
+        private final CompletableFuture<OpenClawMessage> future;
+
+        private PendingRequest(String method, CompletableFuture<OpenClawMessage> future) {
+            this.method = method;
+            this.future = future;
+        }
+
+        private String method() {
+            return method;
+        }
+
+        private CompletableFuture<OpenClawMessage> future() {
+            return future;
+        }
     }
 
-    // 保存一次 runId 对应的对话聚合结果。
+    // 按 runId 聚合一次完整对话的流式事件。
     private static final class ChatConversation {
-        // 保存当前 runId。
         private final String runId;
-        // 保存拼接后的助手文本。
         private final StringBuilder assistantContent = new StringBuilder();
-        // 保存原始 event 报文列表。
-        private final List<String> rawEvents = new ArrayList<>();
-        // 保存对话完成信号。
-        private final CompletableFuture<Void> completed = new CompletableFuture<>();
-        // 保存错误信息文本。
+        private final List<String> rawEvents = new ArrayList<String>();
+        private final CompletableFuture<Void> completed = new CompletableFuture<Void>();
         private String errorMessage;
 
         private ChatConversation(String runId) {
             this.runId = runId;
         }
 
-        // 接收并处理一条 event 消息。
+        // 接收并处理一条原始事件。
         private synchronized void accept(OpenClawMessage message, String rawMessage) {
             if (completed.isDone()) {
                 return;
@@ -823,40 +706,33 @@ public final class OpenClawClient implements AutoCloseable {
             if (message.payload() == null) {
                 return;
             }
-
             String event = message.event() == null ? "" : message.event();
             if ("agent".equals(event)) {
                 acceptAgentPayload(message.payload());
-                return;
-            }
-            if ("chat".equals(event)) {
+            } else if ("chat".equals(event)) {
                 acceptChatPayload(message.payload());
             }
         }
 
-        // 处理 agent 流式事件。
+        // 聚合 agent 事件中的文本增量和生命周期结束信号。
         private void acceptAgentPayload(JsonNode payload) {
             String stream = text(payload, "stream");
             JsonNode data = payload.get("data");
-
             if ("assistant".equals(stream) && data != null && data.has("delta")) {
                 String delta = data.get("delta").asText("");
                 if (!delta.isEmpty()) {
                     assistantContent.append(delta);
                 }
-                return;
-            }
-
-            if ("lifecycle".equals(stream) && data != null && "end".equals(text(data, "phase"))) {
+            } else if ("lifecycle".equals(stream) && data != null && "end".equals(text(data, "phase"))) {
                 completed.complete(null);
             }
         }
 
-        // 处理 chat 状态事件。
+        // 处理 chat 事件中的错误状态。
         private void acceptChatPayload(JsonNode payload) {
             if ("error".equals(text(payload, "state"))) {
                 String message = text(payload, "message");
-                if (message.isBlank()) {
+                if (isBlank(message)) {
                     message = "assistant stream returned error state";
                 }
                 errorMessage = message;
@@ -864,23 +740,27 @@ public final class OpenClawClient implements AutoCloseable {
             }
         }
 
-        // 等待当前对话结束。
+        // 等待当前对话完成。
         private CompletableFuture<Void> await(Duration timeout) {
-            Duration effective = timeout == null ? DEFAULT_STREAM_TIMEOUT : timeout;
-            CompletableFuture<Void> result = new CompletableFuture<>();
+            CompletableFuture<Void> result = new CompletableFuture<Void>();
             completed.whenComplete((ignored, error) -> {
                 if (error != null) {
                     result.completeExceptionally(error);
-                    return;
+                } else {
+                    result.complete(null);
                 }
-                result.complete(null);
             });
-            return result.orTimeout(effective.toMillis(), TimeUnit.MILLISECONDS);
+            return applyTimeout(result, timeout == null ? DEFAULT_STREAM_TIMEOUT : timeout, "OpenClaw stream");
         }
 
-        // 生成当前对话的不可变快照。
+        // 生成当前对话的只读快照。
         private synchronized ChatConversationSnapshot snapshot() {
-            return new ChatConversationSnapshot(runId, assistantContent.toString(), List.copyOf(rawEvents), errorMessage);
+            return new ChatConversationSnapshot(
+                    runId,
+                    assistantContent.toString(),
+                    Collections.unmodifiableList(new ArrayList<String>(rawEvents)),
+                    errorMessage
+            );
         }
 
         // 将当前对话标记为失败。
@@ -891,14 +771,41 @@ public final class OpenClawClient implements AutoCloseable {
             errorMessage = error.getMessage() == null ? error.getClass().getName() : error.getMessage();
             completed.completeExceptionally(new IllegalStateException(errorMessage, error));
         }
+
+        private String runId() {
+            return runId;
+        }
     }
 
-    // 保存一次完整对话的结果快照。
-    private record ChatConversationSnapshot(
-            String runId,
-            String assistantContent,
-            List<String> rawEvents,
-            String errorMessage
-    ) {
+    // 保存一次完整对话的聚合结果。
+    private static final class ChatConversationSnapshot {
+        private final String runId;
+        private final String assistantContent;
+        private final List<String> rawEvents;
+        private final String errorMessage;
+
+        private ChatConversationSnapshot(String runId, String assistantContent, List<String> rawEvents, String errorMessage) {
+            this.runId = runId;
+            this.assistantContent = assistantContent;
+            this.rawEvents = rawEvents;
+            this.errorMessage = errorMessage;
+        }
+
+        private String runId() {
+            return runId;
+        }
+
+        private String assistantContent() {
+            return assistantContent;
+        }
+
+        private List<String> rawEvents() {
+            return rawEvents;
+        }
+
+        @SuppressWarnings("unused")
+        private String errorMessage() {
+            return errorMessage;
+        }
     }
 }

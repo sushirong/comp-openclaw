@@ -19,7 +19,7 @@
 
 ## 2. 环境要求
 
-- JDK 17
+- JDK 8
 - Maven 3.8+
 - 可访问的 OpenClaw 网关
 - 可用的网关 Token
