@@ -42,7 +42,7 @@ target/openclaw-java-sdk-demo-1.0.0-SNAPSHOT.jar
 说明：
 
 - 该产物适合作为普通 SDK jar 被其他项目依赖。
-- 当前项目没有配置 fat-jar 或 shaded-jar，不建议把它当成双击即可运行的独立可执行包。
+- 当前项目已配置可执行 jar 打包，执行 `mvn clean package` 后可直接通过 `java -jar` 启动控制台 Demo。
 - 控制台 Demo 推荐通过 Maven 的 `exec:java` 方式启动。
 
 ## 3. 快速开始
@@ -65,6 +65,12 @@ mvn clean package
 
 ```bash
 mvn exec:java -Dopenclaw.token=你的token
+```
+
+也可以直接启动打包后的可执行 jar：
+
+```bash
+java -Dopenclaw.token=你的token -jar target/openclaw-java-sdk-demo-1.0.0-SNAPSHOT.jar
 ```
 
 同时指定网关地址与 Token：
