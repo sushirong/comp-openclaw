@@ -64,6 +64,17 @@ public final class OpenClawClient implements AutoCloseable {
     private static final String DEFAULT_PLATFORM = "java";
     private static final String DEFAULT_DEVICE_FAMILY = "desktop";
     private static final String DEFAULT_USER_AGENT = "openclaw-java-sdk-demo/1.0";
+    // Gateway 内置 cron 调度相关的底层协议方法名。
+    private static final String METHOD_CRON_ADD = "cron.add";
+    private static final String METHOD_CRON_RUN = "cron.run";
+    private static final String METHOD_CRON_REMOVE = "cron.remove";
+    private static final String METHOD_CRON_LIST = "cron.list";
+    private static final String METHOD_CRON_STATUS = "cron.status";
+    private static final String METHOD_CRON_RUNS = "cron.runs";
+    private static final String DEFAULT_CRON_SESSION_TARGET = "isolated";
+    private static final String DEFAULT_CRON_MAIN_SESSION = "main";
+    private static final String DEFAULT_CRON_WAKE_MODE_MAIN = "now";
+    private static final String DEFAULT_CRON_WAKE_MODE_AGENT = "next-heartbeat";
     // Ed25519 公钥的 SPKI 前缀，用于提取 32 字节 raw public key。
     private static final byte[] ED25519_SPKI_PREFIX = hex("302a300506032b6570032100");
     // 通过 BouncyCastle 提供 JDK 8 下的 Ed25519 支持。
@@ -242,6 +253,286 @@ public final class OpenClawClient implements AutoCloseable {
 
         Duration effective = timeout == null ? DEFAULT_REQUEST_TIMEOUT : timeout;
         return applyTimeout(responseFuture, effective, "OpenClaw request");
+    }
+
+    /**
+     * 创建定时任务并返回原始响应消息。
+     *
+     * <p>该便捷方法按官方 cron 工具调用协议构造请求，默认创建一个
+     * {@code sessionTarget=isolated} 的循环任务，并把提示词写入
+     * {@code payload.kind=agentTurn.message}。
+     *
+     * @param jobName 任务名称
+     * @param cronExpr Cron 表达式
+     * @param promptTemplate 提示词模板
+     * @return 创建任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> createScheduleJob(String jobName, String cronExpr, String promptTemplate) {
+        return createScheduleJob(
+                jobName,
+                cronExpr,
+                promptTemplate,
+                DEFAULT_CRON_SESSION_TARGET,
+                DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_STREAM_TIMEOUT,
+                null,
+                DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
+    /**
+     * 创建定时任务并返回原始响应消息。
+     *
+     * <p>该重载保留原有 SDK 方法签名，但底层会映射到官方 {@code cron.add} 协议。
+     * 其中 {@code sessionKey} 会映射为 cron 的 {@code sessionTarget}：
+     * <ul>
+     *     <li>{@code main} -> {@code sessionTarget=main} + {@code payload.kind=systemEvent}</li>
+     *     <li>{@code isolated} 或空 -> {@code sessionTarget=isolated} + {@code payload.kind=agentTurn}</li>
+     *     <li>其他值 -> {@code sessionTarget=session:<sessionKey>} + {@code payload.kind=agentTurn}</li>
+     * </ul>
+     * 现阶段官方 cron 协议未直接暴露旧版 SDK 中的
+     * {@code requestTimeout / streamTimeout / resultMode} 字段，因此这里不会写入请求。
+     *
+     * @param jobName 任务名称
+     * @param cronExpr Cron 表达式
+     * @param promptTemplate 提示词模板
+     * @param sessionKey 会话标识，为空时回退到默认会话
+     * @param requestTimeout 任务执行时 chat.send 请求超时时间
+     * @param streamTimeout 任务执行时等待流式响应结束的超时时间
+     * @param resultMode 任务结果保存模式，例如 {@code text}、{@code raw_event}、{@code tower_stream} 或 {@code all}
+     * @param timeout 当前创建请求本身的超时时间
+     * @return 创建任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> createScheduleJob(
+            String jobName,
+            String cronExpr,
+            String promptTemplate,
+            String sessionKey,
+            Duration requestTimeout,
+            Duration streamTimeout,
+            String resultMode,
+            Duration timeout
+    ) {
+        return createScheduleJob(
+                buildCronAddParams(
+                        jobName,
+                        cronExpr,
+                        promptTemplate,
+                        sessionKey
+                ),
+                timeout
+        );
+    }
+
+    /**
+     * 使用完整参数创建定时任务并返回原始响应消息。
+     *
+     * <p>当需要使用官方 cron 工具更多字段时，推荐直接传入完整的 {@link JsonNode}。
+     * 底层实际调用的是 {@code cron.add}。
+     *
+     * @param params 创建任务参数
+     * @return 创建任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> createScheduleJob(JsonNode params) {
+        return createScheduleJob(params, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 使用完整参数创建定时任务并返回原始响应消息。
+     *
+     * @param params 创建任务参数
+     * @param timeout 请求超时时间
+     * @return 创建任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> createScheduleJob(JsonNode params, Duration timeout) {
+        Objects.requireNonNull(params, "params is required");
+        return call(METHOD_CRON_ADD, params, timeout);
+    }
+
+    /**
+     * 手动执行指定定时任务并返回原始响应消息。
+     *
+     * <p>该方法是对“手动触发任务”的语义化封装，底层实际调用
+     * {@code cron.run}。
+     *
+     * @param jobId 任务 ID
+     * @return 执行任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> executeScheduleJob(String jobId) {
+        return triggerScheduleJob(jobId, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 手动执行指定定时任务并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @param timeout 请求超时时间
+     * @return 执行任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> executeScheduleJob(String jobId, Duration timeout) {
+        return triggerScheduleJob(jobId, timeout);
+    }
+
+    /**
+     * 手动触发指定定时任务并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @return 执行任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> triggerScheduleJob(String jobId) {
+        return triggerScheduleJob(jobId, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 手动触发指定定时任务并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @param timeout 请求超时时间
+     * @return 执行任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> triggerScheduleJob(String jobId, Duration timeout) {
+        return triggerScheduleJob(jobId, null, timeout);
+    }
+
+    /**
+     * 手动触发指定定时任务并返回原始响应消息。
+     *
+     * <p>当调度服务支持附加执行参数时，可以通过 {@code params} 一并传入。
+     * SDK 会统一补上 {@code jobId} 字段。
+     *
+     * @param jobId 任务 ID
+     * @param params 额外执行参数
+     * @param timeout 请求超时时间
+     * @return 执行任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> triggerScheduleJob(String jobId, JsonNode params, Duration timeout) {
+        return call(METHOD_CRON_RUN, buildCronRunParams(jobId, params), timeout);
+    }
+
+    /**
+     * 删除指定定时任务并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @return 删除任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> deleteScheduleJob(String jobId) {
+        return deleteScheduleJob(jobId, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 删除指定定时任务并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @param timeout 请求超时时间
+     * @return 删除任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> deleteScheduleJob(String jobId, Duration timeout) {
+        return deleteScheduleJob(jobId, null, timeout);
+    }
+
+    /**
+     * 删除指定定时任务并返回原始响应消息。
+     *
+     * <p>当调度服务要求额外删除参数时，可以通过 {@code params} 一并透传。
+     * SDK 会统一补上 {@code jobId} 字段。
+     *
+     * @param jobId 任务 ID
+     * @param params 额外删除参数
+     * @param timeout 请求超时时间
+     * @return 删除任务的原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> deleteScheduleJob(String jobId, JsonNode params, Duration timeout) {
+        return call(METHOD_CRON_REMOVE, buildCronJobIdParams(jobId, params), timeout);
+    }
+
+    /**
+     * 查询全部定时任务并返回原始响应消息。
+     *
+     * @return 任务列表原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> listScheduleJobs() {
+        return listScheduleJobs(null, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 查询全部定时任务并返回原始响应消息。
+     *
+     * @param timeout 请求超时时间
+     * @return 任务列表原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> listScheduleJobs(Duration timeout) {
+        return listScheduleJobs(null, timeout);
+    }
+
+    /**
+     * 查询定时任务列表并返回原始响应消息。
+     *
+     * <p>如果后端支持分页、状态过滤等附加查询条件，可以通过 {@code params} 透传。
+     * 当 {@code params} 为空时，SDK 会自动发送空对象，语义上等同于“查询全部任务”。
+     *
+     * @param params 查询参数
+     * @param timeout 请求超时时间
+     * @return 任务列表原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> listScheduleJobs(JsonNode params, Duration timeout) {
+        JsonNode effectiveParams = params == null ? objectMapper.createObjectNode() : params;
+        return call(METHOD_CRON_LIST, effectiveParams, timeout);
+    }
+
+    /**
+     * 查询单个定时任务状态并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @return 任务状态原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> getScheduleJobStatus(String jobId) {
+        return getScheduleJobStatus(jobId, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 查询单个定时任务状态并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @param timeout 请求超时时间
+     * @return 任务状态原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> getScheduleJobStatus(String jobId, Duration timeout) {
+        return call(METHOD_CRON_STATUS, buildCronJobIdParams(jobId, null), timeout);
+    }
+
+    /**
+     * 查询指定定时任务的执行记录并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @return 任务执行记录原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> listScheduleJobRuns(String jobId) {
+        return listScheduleJobRuns(jobId, null, null, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /**
+     * 查询指定定时任务的执行记录并返回原始响应消息。
+     *
+     * @param jobId 任务 ID
+     * @param limit 返回条数
+     * @param offset 偏移量
+     * @param timeout 请求超时时间
+     * @return 任务执行记录原始响应消息
+     */
+    public CompletableFuture<OpenClawMessage> listScheduleJobRuns(
+            String jobId,
+            Integer limit,
+            Integer offset,
+            Duration timeout
+    ) {
+        ObjectNode params = buildCronJobIdParams(jobId, null);
+        if (limit != null) {
+            params.put("limit", limit.intValue());
+        }
+        if (offset != null) {
+            params.put("offset", offset.intValue());
+        }
+        return call(METHOD_CRON_RUNS, params, timeout);
     }
 
     /**
@@ -541,6 +832,7 @@ public final class OpenClawClient implements AutoCloseable {
         ArrayNode scopes = objectMapper.createArrayNode();
         scopes.add("operator.read");
         scopes.add("operator.write");
+        scopes.add("operator.admin");
         params.set("scopes", scopes);
 
         params.set("caps", objectMapper.createArrayNode());
@@ -556,7 +848,7 @@ public final class OpenClawClient implements AutoCloseable {
         long signedAt = System.currentTimeMillis();
         String signaturePayload = String.join("|",
                 "v3", deviceId, DEFAULT_CLIENT_ID, DEFAULT_CLIENT_MODE, DEFAULT_ROLE,
-                "operator.read,operator.write", String.valueOf(signedAt),
+                "operator.read,operator.write,operator.admin", String.valueOf(signedAt),
                 config.authToken() == null ? "" : config.authToken(),
                 nonce, DEFAULT_PLATFORM, DEFAULT_DEVICE_FAMILY);
 
@@ -568,6 +860,71 @@ public final class OpenClawClient implements AutoCloseable {
         device.put("nonce", nonce);
         params.set("device", device);
         return params;
+    }
+
+    /**
+     * 组装官方 {@code cron.add} 请求参数。
+     */
+    private ObjectNode buildCronAddParams(
+            String jobName,
+            String cronExpr,
+            String promptTemplate,
+            String sessionKey
+    ) {
+        String sessionTarget = normalizeCronSessionTarget(sessionKey);
+
+        ObjectNode params = objectMapper.createObjectNode();
+        params.put("name", requireText(jobName, "jobName is required"));
+
+        ObjectNode schedule = params.putObject("schedule");
+        schedule.put("kind", "cron");
+        schedule.put("expr", normalizeCronExpr(cronExpr));
+
+        params.put("sessionTarget", sessionTarget);
+        params.put("wakeMode", DEFAULT_CRON_MAIN_SESSION.equals(sessionTarget)
+                ? DEFAULT_CRON_WAKE_MODE_MAIN
+                : DEFAULT_CRON_WAKE_MODE_AGENT);
+
+        ObjectNode payload = params.putObject("payload");
+        if (DEFAULT_CRON_MAIN_SESSION.equals(sessionTarget)) {
+            payload.put("kind", "systemEvent");
+            payload.put("text", requireText(promptTemplate, "promptTemplate is required"));
+        } else {
+            payload.put("kind", "agentTurn");
+            payload.put("message", requireText(promptTemplate, "promptTemplate is required"));
+            payload.put("lightContext", true);
+        }
+        return params;
+    }
+
+    /**
+     * 组装带 {@code jobId} 的 cron 请求参数。
+     */
+    private ObjectNode buildCronJobIdParams(String jobId, JsonNode params) {
+        ObjectNode request;
+        if (params == null || params.isNull()) {
+            request = objectMapper.createObjectNode();
+        } else if (params.isObject()) {
+            request = ((ObjectNode) params).deepCopy();
+        } else {
+            throw new IllegalArgumentException("params must be an object node");
+        }
+        request.put("jobId", requireText(jobId, "jobId is required"));
+        return request;
+    }
+
+    /**
+     * 组装 {@code cron.run} 请求参数。
+     *
+     * <p>官方接口支持 {@code mode=force|due}，为保持原有 execute 语义，这里默认补
+     * {@code force}；调用方如显式传入 {@code mode}，则保留原值。
+     */
+    private ObjectNode buildCronRunParams(String jobId, JsonNode params) {
+        ObjectNode request = buildCronJobIdParams(jobId, params);
+        if (!request.hasNonNull("mode")) {
+            request.put("mode", "force");
+        }
+        return request;
     }
 
     /**
@@ -864,6 +1221,42 @@ public final class OpenClawClient implements AutoCloseable {
     // JDK 8 兼容版的空白判断。
     private static boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    // 校验字符串是否包含有效文本，并返回去除首尾空白后的结果。
+    private static String requireText(String value, String message) {
+        if (isBlank(value)) {
+            throw new IllegalArgumentException(message);
+        }
+        return value.trim();
+    }
+
+    // 将旧版 Quartz 风格中的 ? 兼容转换为 OpenClaw cron 可接受的 *。
+    private static String normalizeCronExpr(String cronExpr) {
+        String normalized = requireText(cronExpr, "cronExpr is required").replace('?', '*');
+        String[] parts = normalized.split("\\s+");
+        if (parts.length != 5 && parts.length != 6) {
+            throw new IllegalArgumentException("cronExpr must use 5 fields or 6 fields with seconds");
+        }
+        return normalized;
+    }
+
+    // 将历史 SDK 的 sessionKey 兼容映射为官方 cron 的 sessionTarget。
+    private static String normalizeCronSessionTarget(String sessionKey) {
+        if (isBlank(sessionKey)) {
+            return DEFAULT_CRON_SESSION_TARGET;
+        }
+        String normalized = sessionKey.trim();
+        if (DEFAULT_CRON_MAIN_SESSION.equalsIgnoreCase(normalized)) {
+            return DEFAULT_CRON_MAIN_SESSION;
+        }
+        if (DEFAULT_CRON_SESSION_TARGET.equalsIgnoreCase(normalized)) {
+            return DEFAULT_CRON_SESSION_TARGET;
+        }
+        if (normalized.startsWith("session:")) {
+            return normalized;
+        }
+        return "session:" + normalized;
     }
 
     // 安全读取 JsonNode 中的文本字段。

@@ -12,6 +12,7 @@
 - 返回解析后纯文本的对话调用能力
 - 返回原始 `event` 消息体列表的对话调用能力
 - 返回小塔 APP 兼容事件对象列表的对话调用能力
+- 定时任务创建、执行、删除、查询能力
 - 控制台对话 Demo
 
 如果你的目标是把它作为 SDK 集成到其他项目中，重点关注“SDK 使用方式”和“对话调用方式”章节。
@@ -457,6 +458,196 @@ client.setEventListener(message -> {
 - `setEventListener(...)` 适合实时监听原始 `OpenClawMessage`
 - `streamChatRawEvents(..., TOWER_APP, ...)` 适合实时消费小塔 APP 兼容事件
 - `sendChatRawEvents(...)` 适合在一次调用结束后统一收集
+
+### 7.7 定时任务相关方法
+
+当前 SDK 额外补充了 4 类定时任务管理能力：
+
+- 创建定时任务 `createScheduleJob(...)`
+- 手动执行定时任务 `executeScheduleJob(...)`
+- 删除定时任务 `deleteScheduleJob(...)`
+- 查询全部定时任务 `listScheduleJobs(...)`
+
+这些方法底层仍然走 `OpenClawClient.call(...)` 这一套协议封装，但需要对齐 Gateway 官方 cron 协议，当前对应的底层方法名分别是：
+
+- `cron.add`
+- `cron.run`
+- `cron.remove`
+- `cron.list`
+
+另外补充了两个便于排查和追踪的接口：
+
+- 查询单个任务状态 `getScheduleJobStatus(...)`，底层对应 `cron.status`
+- 查询任务执行记录 `listScheduleJobRuns(...)`，底层对应 `cron.runs`
+
+返回值统一为 `CompletableFuture<OpenClawMessage>`，方便和现有 SDK 的响应处理方式保持一致。
+
+说明：
+
+- `cronExpr` 需要按 Gateway 官方 cron 工具格式传入，推荐直接使用 5 段写法，例如 `0 9 * * *`
+- 如果你手头是 Quartz 风格表达式，例如 `0 0 9 * * ?`，SDK 会把其中的 `?` 兼容转换为 `*`
+- 便捷重载默认创建 `sessionTarget=isolated` 的任务；如果传入 `sessionKey=main`，则会映射为主会话任务
+- 如果需要使用 cron 工具的完整字段，优先使用 `JsonNode` 重载自行透传官方参数
+
+#### 7.7.1 `createScheduleJob(...)`
+
+常用签名：
+
+```java
+createScheduleJob(String jobName, String cronExpr, String promptTemplate)
+createScheduleJob(
+        String jobName,
+        String cronExpr,
+        String promptTemplate,
+        String sessionKey,
+        Duration requestTimeout,
+        Duration streamTimeout,
+        String resultMode,
+        Duration timeout
+)
+createScheduleJob(JsonNode params)
+createScheduleJob(JsonNode params, Duration timeout)
+```
+
+说明：
+
+- 便捷重载会自动组装官方 `cron.add` 所需的 `name / schedule / sessionTarget / payload`
+- 当 `sessionKey=main` 时，SDK 会发送 `payload.kind=systemEvent`
+- 当 `sessionKey` 为空、`isolated` 或自定义值时，SDK 会发送 `payload.kind=agentTurn`
+- 旧版签名中的 `requestTimeout / streamTimeout / resultMode` 不再直接写入 cron 定义；如果需要高级参数，请使用 `JsonNode` 重载
+
+示例：
+
+```java
+import com.example.openclaw.client.OpenClawClient;
+import com.example.openclaw.model.OpenClawMessage;
+
+try (OpenClawClient client = OpenClawClient
+        .init("ws://127.0.0.1:18789", "你的token")
+        .join()) {
+    OpenClawMessage response = client.createScheduleJob(
+            "日报总结任务",
+            "0 9 * * *",
+            "请按日报模板总结今天的处理结果"
+    ).join();
+
+    System.out.println("ok = " + response.ok());
+    System.out.println("payload = " + response.payload());
+    System.out.println("error = " + response.error());
+}
+```
+
+#### 7.7.2 `executeScheduleJob(...)`
+
+常用签名：
+
+```java
+executeScheduleJob(String jobId)
+executeScheduleJob(String jobId, Duration timeout)
+```
+
+说明：
+
+- 该方法是“手动执行任务”的语义化封装
+- 底层实际调用的是 `cron.run`
+- SDK 默认会补上 `mode=force`
+- 如果你需要附加执行参数，也可以使用 `triggerScheduleJob(String jobId, JsonNode params, Duration timeout)`
+
+示例：
+
+```java
+OpenClawMessage response = client.executeScheduleJob("job-001").join();
+System.out.println("ok = " + response.ok());
+System.out.println("payload = " + response.payload());
+System.out.println("error = " + response.error());
+```
+
+#### 7.7.3 `deleteScheduleJob(...)`
+
+常用签名：
+
+```java
+deleteScheduleJob(String jobId)
+deleteScheduleJob(String jobId, Duration timeout)
+deleteScheduleJob(String jobId, JsonNode params, Duration timeout)
+```
+
+示例：
+
+```java
+OpenClawMessage response = client.deleteScheduleJob("job-001").join();
+System.out.println("ok = " + response.ok());
+System.out.println("payload = " + response.payload());
+System.out.println("error = " + response.error());
+```
+
+#### 7.7.4 `listScheduleJobs(...)`
+
+常用签名：
+
+```java
+listScheduleJobs()
+listScheduleJobs(Duration timeout)
+listScheduleJobs(JsonNode params, Duration timeout)
+```
+
+说明：
+
+- 不传参数时，语义上等同于“查询全部定时任务”
+- 如果需要分页、启停状态、排序等附加查询条件，可以通过 `JsonNode params` 透传官方 `cron.list` 参数
+
+示例：
+
+```java
+ObjectNode params = objectMapper.createObjectNode();
+params.put("includeDisabled", true);
+params.put("limit", 50);
+params.put("offset", 0);
+params.put("enabled", "all");
+params.put("sortBy", "nextRunAtMs");
+params.put("sortDir", "asc");
+
+OpenClawMessage response = client.listScheduleJobs(params, Duration.ofSeconds(30)).join();
+System.out.println("ok = " + response.ok());
+System.out.println("payload = " + response.payload());
+System.out.println("error = " + response.error());
+```
+
+#### 7.7.5 `getScheduleJobStatus(...)`
+
+常用签名：
+
+```java
+getScheduleJobStatus(String jobId)
+getScheduleJobStatus(String jobId, Duration timeout)
+```
+
+示例：
+
+```java
+OpenClawMessage response = client.getScheduleJobStatus("job-001").join();
+System.out.println("ok = " + response.ok());
+System.out.println("payload = " + response.payload());
+System.out.println("error = " + response.error());
+```
+
+#### 7.7.6 `listScheduleJobRuns(...)`
+
+常用签名：
+
+```java
+listScheduleJobRuns(String jobId)
+listScheduleJobRuns(String jobId, Integer limit, Integer offset, Duration timeout)
+```
+
+示例：
+
+```java
+OpenClawMessage response = client.listScheduleJobRuns("job-001", 20, 0, Duration.ofSeconds(30)).join();
+System.out.println("ok = " + response.ok());
+System.out.println("payload = " + response.payload());
+System.out.println("error = " + response.error());
+```
 
 ## 8. Demo 运行说明
 
