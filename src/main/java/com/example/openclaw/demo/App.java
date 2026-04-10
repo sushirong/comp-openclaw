@@ -45,7 +45,7 @@ public final class App {
             );
         } catch (IllegalArgumentException ex) {
             System.err.println("[错误] openclaw.responseFormat 配置非法：" + ex.getMessage());
-            System.err.println("可选值：text、event");
+            System.err.println("可选值：text、event、tower-stream");
             return;
         }
 
@@ -118,6 +118,10 @@ public final class App {
             printEventResponse(client, sessionKey, message, requestTimeout, streamTimeout);
             return;
         }
+        if (responseFormat == ResponseFormat.TOWER_STREAM) {
+            printTowerStreamResponse(client, sessionKey, message, requestTimeout, streamTimeout);
+            return;
+        }
         printTextResponse(client, sessionKey, message, requestTimeout, streamTimeout);
     }
 
@@ -149,9 +153,27 @@ public final class App {
         }
     }
 
+    private static void printTowerStreamResponse(
+            OpenClawClient client,
+            String sessionKey,
+            String message,
+            Duration requestTimeout,
+            Duration streamTimeout
+    ) {
+        client.streamChatRawEvents(
+                sessionKey,
+                message,
+                requestTimeout,
+                streamTimeout,
+                OpenClawClient.RawEventMappingType.TOWER_APP,
+                event -> System.out.println("event> " + event)
+        ).join();
+    }
+
     private enum ResponseFormat {
         TEXT("text"),
-        EVENT("event");
+        EVENT("event"),
+        TOWER_STREAM("tower-stream");
 
         private final String value;
 

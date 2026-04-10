@@ -1,11 +1,8 @@
 package com.example.openclaw.demo;
 
 import com.example.openclaw.client.OpenClawClient;
-import com.example.openclaw.model.TowerAppSseEvent;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
-import java.util.List;
 
 public class Test {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -18,15 +15,18 @@ public class Test {
             for (String event : events) {
                 System.out.println(event);
             }*/
-            List<TowerAppSseEvent> events = client.sendChatRawEvents(
+            client.streamChatRawEvents(
                     "北京现在的天气？",
-                    OpenClawClient.RawEventMappingType.TOWER_APP
+                    OpenClawClient.RawEventMappingType.TOWER_APP,
+                    event -> {
+                        try {
+                            System.out.println(OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(event));
+                        } catch (JsonProcessingException ex) {
+                            throw new RuntimeException(ex);
+                        }
+                    }
             ).join();
-
-            for (TowerAppSseEvent event : events) {
-                System.out.println(OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(event));
-            }
-        } catch (JsonProcessingException e) {
+        } catch (RuntimeException e) {
             throw new RuntimeException(e);
         }
     }

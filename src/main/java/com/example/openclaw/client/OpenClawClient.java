@@ -379,7 +379,65 @@ public final class OpenClawClient implements AutoCloseable {
     }
 
     /**
-     * 注册外部事件监听器。
+     * Streams mapped Tower APP events to the callback as soon as they arrive.
+     */
+    public CompletableFuture<Void> streamChatRawEvents(
+            String message,
+            RawEventMappingType mappingType,
+            Consumer<TowerAppSseEvent> onEvent
+    ) {
+        return streamChatRawEvents(
+                DEFAULT_SESSION_KEY,
+                message,
+                DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_STREAM_TIMEOUT,
+                mappingType,
+                onEvent
+        );
+    }
+
+    /**
+     * Streams mapped Tower APP events to the callback as soon as they arrive.
+     */
+    public CompletableFuture<Void> streamChatRawEvents(
+            String sessionKey,
+            String message,
+            RawEventMappingType mappingType,
+            Consumer<TowerAppSseEvent> onEvent
+    ) {
+        return streamChatRawEvents(
+                sessionKey,
+                message,
+                DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_STREAM_TIMEOUT,
+                mappingType,
+                onEvent
+        );
+    }
+
+    /**
+     * Streams mapped Tower APP events to the callback as soon as they arrive.
+     */
+    public CompletableFuture<Void> streamChatRawEvents(
+            String sessionKey,
+            String message,
+            Duration requestTimeout,
+            Duration streamTimeout,
+            RawEventMappingType mappingType,
+            Consumer<TowerAppSseEvent> onEvent
+    ) {
+        Objects.requireNonNull(mappingType, "mappingType is required");
+        Objects.requireNonNull(onEvent, "onEvent is required");
+        return executeStreamingChatConversation(sessionKey, message, requestTimeout, streamTimeout, rawEvent -> {
+            TowerAppSseEvent mappedEvent = mapRawEvent(rawEvent, mappingType);
+            if (mappedEvent != null) {
+                onEvent.accept(mappedEvent);
+            }
+        });
+    }
+
+    /**
+     * Registers a global listener for raw OpenClaw messages.
      */
     public void setEventListener(Consumer<OpenClawMessage> listener) {
         this.eventListener = listener;
@@ -428,6 +486,39 @@ public final class OpenClawClient implements AutoCloseable {
     /**
      * 组装 connect 请求所需参数。
      */
+    private CompletableFuture<Void> executeStreamingChatConversation(
+            String sessionKey,
+            String message,
+            Duration requestTimeout,
+            Duration streamTimeout,
+            Consumer<String> rawEventSink
+    ) {
+        final Duration effectiveRequestTimeout = requestTimeout == null ? DEFAULT_REQUEST_TIMEOUT : requestTimeout;
+        final Duration effectiveStreamTimeout = streamTimeout == null ? DEFAULT_STREAM_TIMEOUT : streamTimeout;
+
+        return sendChat(sessionKey, message, effectiveRequestTimeout).thenCompose(response -> {
+            if (!Boolean.TRUE.equals(response.ok())) {
+                return failedFuture(new IllegalStateException("chat.send rejected: " + describeJson(response.error())));
+            }
+
+            String runId = response.payload() == null ? null : response.payload().path("runId").asText(null);
+            if (isBlank(runId)) {
+                return failedFuture(new IllegalStateException("chat.send response does not contain runId"));
+            }
+
+            final ChatConversation conversation = conversations.computeIfAbsent(runId, ChatConversation::new);
+            try {
+                conversation.bindRawEventSink(rawEventSink);
+            } catch (RuntimeException error) {
+                conversations.remove(conversation.runId(), conversation);
+                return failedFuture(error);
+            }
+
+            return conversation.await(effectiveStreamTimeout)
+                    .whenComplete((ignored, error) -> conversations.remove(conversation.runId(), conversation));
+        });
+    }
+
     private ObjectNode buildConnectParams(String nonce) {
         ObjectNode params = objectMapper.createObjectNode();
         params.put("minProtocol", PROTOCOL_VERSION);
@@ -486,10 +577,14 @@ public final class OpenClawClient implements AutoCloseable {
      * 不需要改动聊天主流程。
      */
     private List<TowerAppSseEvent> mapRawEvents(List<String> rawEvents, RawEventMappingType mappingType) {
-        if (mappingType != RawEventMappingType.TOWER_APP) {
-            throw new IllegalArgumentException("Unsupported mapping type: " + mappingType);
+        List<TowerAppSseEvent> mappedEvents = new ArrayList<TowerAppSseEvent>();
+        for (String rawEvent : rawEvents) {
+            TowerAppSseEvent mappedEvent = mapRawEvent(rawEvent, mappingType);
+            if (mappedEvent != null) {
+                mappedEvents.add(mappedEvent);
+            }
         }
-        return mapToTowerAppEvents(rawEvents);
+        return mappedEvents;
     }
 
     /**
@@ -498,16 +593,11 @@ public final class OpenClawClient implements AutoCloseable {
      * <p>原始列表中会包含多种事件：握手事件、聊天生命周期事件、文本增量事件以及可能的错误事件。
      * 这里只保留桌面协议真正需要消费的那几类，其余事件直接忽略，避免把无意义中间态暴露给调用方。
      */
-    private List<TowerAppSseEvent> mapToTowerAppEvents(List<String> rawEvents) {
-        List<TowerAppSseEvent> mappedEvents = new ArrayList<TowerAppSseEvent>();
-        for (String rawEvent : rawEvents) {
-            // 每条原始报文独立映射，无法识别或不需要输出的事件直接跳过。
-            TowerAppSseEvent mappedEvent = mapToTowerAppEvent(rawEvent);
-            if (mappedEvent != null) {
-                mappedEvents.add(mappedEvent);
-            }
+    private TowerAppSseEvent mapRawEvent(String rawEvent, RawEventMappingType mappingType) {
+        if (mappingType != RawEventMappingType.TOWER_APP) {
+            throw new IllegalArgumentException("Unsupported mapping type: " + mappingType);
         }
-        return mappedEvents;
+        return mapToTowerAppEvent(rawEvent);
     }
 
     /**
@@ -796,6 +886,13 @@ public final class OpenClawClient implements AutoCloseable {
         return future;
     }
 
+    private static RuntimeException asRuntimeException(Throwable error, String message) {
+        if (error instanceof RuntimeException) {
+            return (RuntimeException) error;
+        }
+        return new IllegalStateException(message, error);
+    }
+
     // JDK 8 兼容版的 CompletableFuture 超时包装。
     private static <T> CompletableFuture<T> applyTimeout(final CompletableFuture<T> future, Duration timeout, String operation) {
         if (timeout == null) {
@@ -963,6 +1060,8 @@ public final class OpenClawClient implements AutoCloseable {
         private final StringBuilder assistantContent = new StringBuilder();
         private final List<String> rawEvents = new ArrayList<String>();
         private final CompletableFuture<Void> completed = new CompletableFuture<Void>();
+        private Consumer<String> rawEventSink;
+        private int streamedRawEventCount;
         private String errorMessage;
 
         private ChatConversation(String runId) {
@@ -975,6 +1074,10 @@ public final class OpenClawClient implements AutoCloseable {
                 return;
             }
             rawEvents.add(rawMessage);
+            RuntimeException deliveryError = deliverPendingRawEvents();
+            if (deliveryError != null || completed.isDone()) {
+                return;
+            }
             if (message.payload() == null) {
                 return;
             }
@@ -984,6 +1087,36 @@ public final class OpenClawClient implements AutoCloseable {
             } else if ("chat".equals(event)) {
                 acceptChatPayload(message.payload());
             }
+        }
+
+        private synchronized void bindRawEventSink(Consumer<String> sink) {
+            Objects.requireNonNull(sink, "rawEventSink is required");
+            if (rawEventSink != null && rawEventSink != sink) {
+                throw new IllegalStateException("raw event sink already registered for runId " + runId);
+            }
+            rawEventSink = sink;
+            RuntimeException deliveryError = deliverPendingRawEvents();
+            if (deliveryError != null) {
+                throw deliveryError;
+            }
+        }
+
+        private RuntimeException deliverPendingRawEvents() {
+            if (rawEventSink == null) {
+                return null;
+            }
+            while (streamedRawEventCount < rawEvents.size()) {
+                String rawEvent = rawEvents.get(streamedRawEventCount);
+                streamedRawEventCount++;
+                try {
+                    rawEventSink.accept(rawEvent);
+                } catch (Throwable error) {
+                    RuntimeException wrapped = asRuntimeException(error, "raw event sink failed");
+                    fail(wrapped);
+                    return wrapped;
+                }
+            }
+            return null;
         }
 
         // 聚合 agent 事件中的文本增量和生命周期结束信号。

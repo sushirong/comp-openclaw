@@ -405,7 +405,41 @@ try (OpenClawClient client = OpenClawClient
 - 你希望保留流式事件语义，但不想自己写字段映射逻辑
 - 你需要拿到 `sseType / eventData / errorMsg` 这一层兼容结构
 
-### 7.5 `setEventListener(...)`
+### 7.5 `streamChatRawEvents(..., RawEventMappingType.TOWER_APP, Consumer<TowerAppSseEvent>)`
+
+实时回调按小塔 APP 协议映射后的兼容事件对象：
+
+```java
+streamChatRawEvents(String message, RawEventMappingType mappingType, Consumer<TowerAppSseEvent> onEvent)
+streamChatRawEvents(String sessionKey, String message, RawEventMappingType mappingType, Consumer<TowerAppSseEvent> onEvent)
+streamChatRawEvents(String sessionKey, String message, Duration requestTimeout, Duration streamTimeout, RawEventMappingType mappingType, Consumer<TowerAppSseEvent> onEvent)
+```
+
+示例：
+
+```java
+import com.example.openclaw.client.OpenClawClient;
+import com.example.openclaw.client.OpenClawClient.RawEventMappingType;
+
+try (OpenClawClient client = OpenClawClient
+        .init("ws://127.0.0.1:18789", "你的token")
+        .join()) {
+    client.streamChatRawEvents(
+            "请实时输出适合小塔 APP 消费的响应事件",
+            RawEventMappingType.TOWER_APP,
+            event -> System.out.println("event> " + event)
+    ).join();
+}
+```
+
+说明：
+
+- `onEvent` 会在流式过程中按顺序收到每条映射后的 `TowerAppSseEvent`
+- 返回的 `CompletableFuture<Void>` 在本轮流式响应结束时完成
+- 如果回调抛异常、网关返回错误或流式超时，`CompletableFuture<Void>` 会异常完成
+- 当你想保留小塔 APP 兼容结构，同时又要实时消费时，优先使用这个方法
+
+### 7.6 `setEventListener(...)`
 
 如果你需要实时监听事件，可以使用：
 
@@ -420,7 +454,8 @@ client.setEventListener(message -> {
 
 说明：
 
-- `setEventListener(...)` 适合实时监听
+- `setEventListener(...)` 适合实时监听原始 `OpenClawMessage`
+- `streamChatRawEvents(..., TOWER_APP, ...)` 适合实时消费小塔 APP 兼容事件
 - `sendChatRawEvents(...)` 适合在一次调用结束后统一收集
 
 ## 8. Demo 运行说明
@@ -455,6 +490,12 @@ mvn exec:java -Dopenclaw.token=你的token -Dopenclaw.responseFormat=text
 mvn exec:java -Dopenclaw.token=你的token -Dopenclaw.responseFormat=event
 ```
 
+使用小塔 APP 实时流式格式启动：
+
+```bash
+mvn exec:java -Dopenclaw.token=你的token -Dopenclaw.responseFormat=tower-stream
+```
+
 ### 8.2 启动参数与环境变量
 
 | 名称 | 类型 | 默认值 | 说明 |
@@ -463,7 +504,7 @@ mvn exec:java -Dopenclaw.token=你的token -Dopenclaw.responseFormat=event
 | `openclaw.token` | JVM 参数 | 空 | 网关 Token，优先级高于环境变量 |
 | `OPENCLAW_GATEWAY_TOKEN` | 环境变量 | 空 | 网关 Token，作为 JVM 参数缺失时的兜底 |
 | `openclaw.sessionKey` | JVM 参数 | `main` | 对话会话键 |
-| `openclaw.responseFormat` | JVM 参数 | `text` | Demo 输出格式；`text` 为解析后的纯文本，`event` 为原始 event |
+| `openclaw.responseFormat` | JVM 参数 | `text` | Demo 输出格式；`text` 为解析后的纯文本，`event` 为原始 event，`tower-stream` 为小塔 APP 兼容事件的实时输出 |
 | `openclaw.timeoutSeconds` | JVM 参数 | `30` | `chat.send` 请求超时秒数 |
 | `openclaw.streamTimeoutSeconds` | JVM 参数 | `180` | 等待流式回复结束的超时秒数 |
 
@@ -566,7 +607,15 @@ mvn exec:java ^
 - 你需要调试事件流
 - 你希望保留更完整的协议层数据
 
-### 9.6 什么时候选 `sendChat(...)`
+### 9.6 什么时候选 `streamChatRawEvents(...)`
+
+优先选择 `streamChatRawEvents(...)` 的场景：
+
+- 你要实时消费小塔 APP 兼容事件
+- 你希望边收边处理 `TowerAppSseEvent`
+- 你不想等整轮结束后再统一拿 `List<TowerAppSseEvent>`
+
+### 9.7 什么时候选 `sendChat(...)`
 
 适合场景：
 
@@ -582,4 +631,5 @@ mvn exec:java ^
 2. 在业务项目中加入 Maven 依赖
 3. 优先使用 `OpenClawClient.init(...).join()` 完成初始化
 4. 优先使用 `sendChatText(...)` 跑通最小闭环
-5. 需要排查协议细节时再增加 `setEventListener(...)` 或 `sendChatRawEvents(...)`
+5. 需要实时消费小塔 APP 兼容事件时，使用 `streamChatRawEvents(...)`
+6. 需要排查更底层的协议细节时，再增加 `setEventListener(...)` 或 `sendChatRawEvents(...)`
