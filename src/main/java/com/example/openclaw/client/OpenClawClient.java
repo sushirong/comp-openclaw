@@ -200,7 +200,8 @@ public final class OpenClawClient implements AutoCloseable {
     public CompletableFuture<Void> connect() {
         Request.Builder builder = new Request.Builder()
                 .url(config.gatewayUri().toString())
-                .addHeader("User-Agent", DEFAULT_USER_AGENT);
+                .addHeader("User-Agent", DEFAULT_USER_AGENT)
+                .addHeader("origin", "http://openclaw-client");
         if (hasText(config.authToken())) {
             String encoded = Base64.getEncoder()
                     .encodeToString(("token:" + config.authToken()).getBytes(StandardCharsets.UTF_8));
