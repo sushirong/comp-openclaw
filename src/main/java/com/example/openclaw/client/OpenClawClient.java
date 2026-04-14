@@ -12,10 +12,12 @@ import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 import okio.ByteString;
+import org.bouncycastle.jcajce.interfaces.EdDSAPrivateKey;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
@@ -24,6 +26,7 @@ import java.security.Provider;
 import java.security.PublicKey;
 import java.security.Security;
 import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -95,6 +98,7 @@ public final class OpenClawClient implements AutoCloseable {
     private final String deviceId;
     // 保存 raw public key 的 base64url 字符串。
     private final String publicKeyRawBase64Url;
+    private final String clientInstanceId;
     // 保存待响应请求映射。
     private final Map<String, PendingRequest> pendingRequests = new ConcurrentHashMap<String, PendingRequest>();
     // 保存按 runId 聚合中的对话上下文。
@@ -130,10 +134,11 @@ public final class OpenClawClient implements AutoCloseable {
                 .connectTimeout(config.connectTimeout().toMillis(), TimeUnit.MILLISECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS)
                 .build();
-        this.deviceKeyPair = generateDeviceKeyPair();
-        byte[] publicKeyRaw = extractEd25519RawPublicKey(deviceKeyPair.getPublic());
-        this.deviceId = sha256Hex(publicKeyRaw);
-        this.publicKeyRawBase64Url = base64Url(publicKeyRaw);
+        ClientIdentity identity = resolveClientIdentity(config);
+        this.deviceKeyPair = identity.deviceKeyPair();
+        this.deviceId = identity.deviceId();
+        this.publicKeyRawBase64Url = identity.publicKeyRawBase64Url();
+        this.clientInstanceId = identity.clientInstanceId();
     }
 
     /**
@@ -201,7 +206,7 @@ public final class OpenClawClient implements AutoCloseable {
         Request.Builder builder = new Request.Builder()
                 .url(config.gatewayUri().toString())
                 .addHeader("User-Agent", DEFAULT_USER_AGENT)
-                .addHeader("origin", "http://openclaw-client");
+                .addHeader("origin", resolveOriginHeaderValue());
         if (hasText(config.authToken())) {
             String encoded = Base64.getEncoder()
                     .encodeToString(("token:" + config.authToken()).getBytes(StandardCharsets.UTF_8));
@@ -823,7 +828,7 @@ public final class OpenClawClient implements AutoCloseable {
         client.put("platform", DEFAULT_PLATFORM);
         client.put("deviceFamily", DEFAULT_DEVICE_FAMILY);
         client.put("mode", DEFAULT_CLIENT_MODE);
-        client.put("instanceId", UUID.randomUUID().toString());
+        client.put("instanceId", clientInstanceId);
         params.set("client", client);
 
         params.put("locale", "zh-CN");
@@ -1139,6 +1144,59 @@ public final class OpenClawClient implements AutoCloseable {
         return newProvider;
     }
 
+    private static ClientIdentity resolveClientIdentity(OpenClawConfig config) {
+        String instanceId = hasText(config.clientInstanceId())
+                ? config.clientInstanceId().trim()
+                : UUID.randomUUID().toString();
+        if (!hasText(config.devicePrivateKeyPkcs8Base64Url())) {
+            if (hasText(config.deviceId())) {
+                throw new IllegalArgumentException("deviceId requires devicePrivateKeyPkcs8Base64Url");
+            }
+            return generateClientIdentity(instanceId);
+        }
+        return restoreClientIdentity(
+                instanceId,
+                config.devicePrivateKeyPkcs8Base64Url(),
+                config.deviceId()
+        );
+    }
+
+    private static ClientIdentity generateClientIdentity(String clientInstanceId) {
+        return buildClientIdentity(clientInstanceId, generateDeviceKeyPair(), null);
+    }
+
+    private static ClientIdentity restoreClientIdentity(
+            String clientInstanceId,
+            String devicePrivateKeyPkcs8Base64Url,
+            String expectedDeviceId
+    ) {
+        byte[] privateKeyEncoded = decodeBase64Url(
+                devicePrivateKeyPkcs8Base64Url,
+                "devicePrivateKeyPkcs8Base64Url"
+        );
+        PrivateKey privateKey = restoreDevicePrivateKey(privateKeyEncoded);
+        PublicKey publicKey = deriveEd25519PublicKey(privateKey);
+        return buildClientIdentity(clientInstanceId, new KeyPair(publicKey, privateKey), expectedDeviceId);
+    }
+
+    private static ClientIdentity buildClientIdentity(
+            String clientInstanceId,
+            KeyPair keyPair,
+            String expectedDeviceId
+    ) {
+        byte[] publicKeyRaw = extractEd25519RawPublicKey(keyPair.getPublic());
+        String actualDeviceId = sha256Hex(publicKeyRaw);
+        if (hasText(expectedDeviceId) && !expectedDeviceId.trim().equals(actualDeviceId)) {
+            throw new IllegalArgumentException("Configured deviceId does not match the provided device private key");
+        }
+        return new ClientIdentity(
+                clientInstanceId,
+                keyPair,
+                actualDeviceId,
+                base64Url(publicKeyRaw)
+        );
+    }
+
     // 生成用于设备身份的 Ed25519 密钥对。
     private static KeyPair generateDeviceKeyPair() {
         try {
@@ -1146,6 +1204,54 @@ public final class OpenClawClient implements AutoCloseable {
         } catch (Exception e) {
             throw new IllegalStateException("Unable to generate device key pair", e);
         }
+    }
+
+    private static PrivateKey restoreDevicePrivateKey(byte[] privateKeyEncoded) {
+        try {
+            KeyFactory keyFactory = KeyFactory.getInstance("Ed25519", BC_PROVIDER);
+            return keyFactory.generatePrivate(new PKCS8EncodedKeySpec(privateKeyEncoded));
+        } catch (Exception e) {
+            throw new IllegalStateException("Unable to restore device private key", e);
+        }
+    }
+
+    private static PublicKey deriveEd25519PublicKey(PrivateKey privateKey) {
+        if (privateKey instanceof EdDSAPrivateKey) {
+            return ((EdDSAPrivateKey) privateKey).getPublicKey();
+        }
+        throw new IllegalStateException("Unable to derive Ed25519 public key from configured private key");
+    }
+
+    private String resolveOriginHeaderValue() {
+        if (hasText(config.origin())) {
+            return config.origin().trim();
+        }
+        return defaultOriginFor(config.gatewayUri());
+    }
+
+    private static String defaultOriginFor(java.net.URI gatewayUri) {
+        String scheme = gatewayUri.getScheme();
+        String originScheme = "wss".equalsIgnoreCase(scheme) ? "https" : "http";
+        String host = gatewayUri.getHost();
+        if (isBlank(host)) {
+            return originScheme + "://openclaw-client";
+        }
+        StringBuilder origin = new StringBuilder();
+        origin.append(originScheme).append("://").append(formatOriginHost(host));
+        int port = gatewayUri.getPort();
+        if (port > 0 && !isDefaultOriginPort(originScheme, port)) {
+            origin.append(':').append(port);
+        }
+        return origin.toString();
+    }
+
+    private static boolean isDefaultOriginPort(String scheme, int port) {
+        return ("http".equalsIgnoreCase(scheme) && port == 80)
+                || ("https".equalsIgnoreCase(scheme) && port == 443);
+    }
+
+    private static String formatOriginHost(String host) {
+        return host.indexOf(':') >= 0 && !host.startsWith("[") ? "[" + host + "]" : host;
     }
 
     // 从 SPKI 编码中提取 32 字节原始公钥。
@@ -1197,6 +1303,14 @@ public final class OpenClawClient implements AutoCloseable {
     // 将字节数组编码为不带补位的 base64url。
     private static String base64Url(byte[] bytes) {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    private static byte[] decodeBase64Url(String value, String fieldName) {
+        try {
+            return Base64.getUrlDecoder().decode(requireText(value, fieldName + " is required"));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException("Unable to decode " + fieldName, e);
+        }
     }
 
     // 将十六进制字符串转换为字节数组。
@@ -1445,6 +1559,41 @@ public final class OpenClawClient implements AutoCloseable {
 
         private CompletableFuture<OpenClawMessage> future() {
             return future;
+        }
+    }
+
+    private static final class ClientIdentity {
+        private final String clientInstanceId;
+        private final KeyPair deviceKeyPair;
+        private final String deviceId;
+        private final String publicKeyRawBase64Url;
+
+        private ClientIdentity(
+                String clientInstanceId,
+                KeyPair deviceKeyPair,
+                String deviceId,
+                String publicKeyRawBase64Url
+        ) {
+            this.clientInstanceId = clientInstanceId;
+            this.deviceKeyPair = deviceKeyPair;
+            this.deviceId = deviceId;
+            this.publicKeyRawBase64Url = publicKeyRawBase64Url;
+        }
+
+        private String clientInstanceId() {
+            return clientInstanceId;
+        }
+
+        private KeyPair deviceKeyPair() {
+            return deviceKeyPair;
+        }
+
+        private String deviceId() {
+            return deviceId;
+        }
+
+        private String publicKeyRawBase64Url() {
+            return publicKeyRawBase64Url;
         }
     }
 

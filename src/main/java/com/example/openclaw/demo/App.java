@@ -31,6 +31,10 @@ public final class App {
         String tokenFromEnv = System.getenv("OPENCLAW_GATEWAY_TOKEN");
         String token = !tokenFromProp.isEmpty() ? tokenFromProp : (tokenFromEnv == null ? "" : tokenFromEnv.trim());
         String sessionKey = System.getProperty("openclaw.sessionKey", DEFAULT_SESSION_KEY);
+        String origin = System.getProperty("openclaw.origin", "").trim();
+        String clientInstanceId = System.getProperty("openclaw.clientInstanceId", "").trim();
+        String deviceId = System.getProperty("openclaw.deviceId", "").trim();
+        String devicePrivateKeyPkcs8 = System.getProperty("openclaw.devicePrivateKeyPkcs8", "").trim();
         Duration requestTimeout = Duration.ofSeconds(
                 Long.parseLong(System.getProperty("openclaw.timeoutSeconds", "30"))
         );
@@ -57,11 +61,23 @@ public final class App {
             return;
         }
 
-        OpenClawConfig config = OpenClawConfig.builder()
+        OpenClawConfig.Builder configBuilder = OpenClawConfig.builder()
                 .gatewayUri(gateway)
                 .connectTimeout(Duration.ofSeconds(10))
-                .authToken(token)
-                .build();
+                .authToken(token);
+        if (!origin.isEmpty()) {
+            configBuilder.origin(origin);
+        }
+        if (!clientInstanceId.isEmpty()) {
+            configBuilder.clientInstanceId(clientInstanceId);
+        }
+        if (!deviceId.isEmpty()) {
+            configBuilder.deviceId(deviceId);
+        }
+        if (!devicePrivateKeyPkcs8.isEmpty()) {
+            configBuilder.devicePrivateKeyPkcs8Base64Url(devicePrivateKeyPkcs8);
+        }
+        OpenClawConfig config = configBuilder.build();
 
         try (OpenClawClient client = new OpenClawClient(config);
              BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {

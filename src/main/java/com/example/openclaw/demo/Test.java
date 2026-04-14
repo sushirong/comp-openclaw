@@ -54,10 +54,21 @@ public class Test {
             System.out.println("list.ok = " + listResponse.ok());
             System.out.println("list.payload = " + listResponse.payload());
             System.out.println("list.error = " + listResponse.error());*/
-            OpenClawMessage response = client.deleteScheduleJob("e683e63e-641f-474e-815c-5c3ee38b5113").join();
+            /*OpenClawMessage response = client.deleteScheduleJob("e683e63e-641f-474e-815c-5c3ee38b5113").join();
             System.out.println("ok = " + response.ok());
             System.out.println("payload = " + response.payload());
-            System.out.println("error = " + response.error());
+            System.out.println("error = " + response.error());*/
+            client.streamChatRawEvents(
+                    "北京现在什么天气？",
+                    OpenClawClient.RawEventMappingType.TOWER_APP,
+                    event -> {
+                        try {
+                            System.out.println(OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(event));
+                        } catch (JsonProcessingException ex) {
+                            throw new RuntimeException(ex);
+                        }
+                    }
+            ).join();
         }
     }
 }
