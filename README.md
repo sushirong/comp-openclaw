@@ -176,15 +176,15 @@ mvn clean install
 
 `OpenClawMessage` 是统一消息模型，主要字段如下：
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `type` | `String` | 消息类型，例如 `req`、`res`、`event` |
-| `event` | `String` | 事件名称，仅 `event` 类型使用 |
-| `id` | `String` | 请求或响应 ID |
-| `method` | `String` | 方法名，例如 `chat.send` |
-| `ok` | `Boolean` | 响应是否成功 |
-| `payload` | `JsonNode` | 请求参数、响应数据或事件内容 |
-| `error` | `JsonNode` | 错误信息 |
+| 字段        | 类型         | 说明                          |
+| --------- | ---------- | --------------------------- |
+| `type`    | `String`   | 消息类型，例如 `req`、`res`、`event` |
+| `event`   | `String`   | 事件名称，仅 `event` 类型使用         |
+| `id`      | `String`   | 请求或响应 ID                    |
+| `method`  | `String`   | 方法名，例如 `chat.send`          |
+| `ok`      | `Boolean`  | 响应是否成功                      |
+| `payload` | `JsonNode` | 请求参数、响应数据或事件内容              |
+| `error`   | `JsonNode` | 错误信息                        |
 
 ## 6. 初始化方式
 
@@ -689,15 +689,15 @@ mvn exec:java -Dopenclaw.token=你的token -Dopenclaw.responseFormat=tower-strea
 
 ### 8.2 启动参数与环境变量
 
-| 名称 | 类型 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `openclaw.gateway` | JVM 参数 | `ws://127.0.0.1:18789` | OpenClaw 网关地址 |
-| `openclaw.token` | JVM 参数 | 空 | 网关 Token，优先级高于环境变量 |
-| `OPENCLAW_GATEWAY_TOKEN` | 环境变量 | 空 | 网关 Token，作为 JVM 参数缺失时的兜底 |
-| `openclaw.sessionKey` | JVM 参数 | `main` | 对话会话键 |
-| `openclaw.responseFormat` | JVM 参数 | `text` | Demo 输出格式；`text` 为解析后的纯文本，`event` 为原始 event，`tower-stream` 为小塔 APP 兼容事件的实时输出 |
-| `openclaw.timeoutSeconds` | JVM 参数 | `30` | `chat.send` 请求超时秒数 |
-| `openclaw.streamTimeoutSeconds` | JVM 参数 | `180` | 等待流式回复结束的超时秒数 |
+| 名称                              | 类型     | 默认值                    | 说明                                                                           |
+| ------------------------------- | ------ | ---------------------- | ---------------------------------------------------------------------------- |
+| `openclaw.gateway`              | JVM 参数 | `ws://127.0.0.1:18789` | OpenClaw 网关地址                                                                |
+| `openclaw.token`                | JVM 参数 | 空                      | 网关 Token，优先级高于环境变量                                                           |
+| `OPENCLAW_GATEWAY_TOKEN`        | 环境变量   | 空                      | 网关 Token，作为 JVM 参数缺失时的兜底                                                     |
+| `openclaw.sessionKey`           | JVM 参数 | `main`                 | 对话会话键                                                                        |
+| `openclaw.responseFormat`       | JVM 参数 | `text`                 | Demo 输出格式；`text` 为解析后的纯文本，`event` 为原始 event，`tower-stream` 为小塔 APP 兼容事件的实时输出 |
+| `openclaw.timeoutSeconds`       | JVM 参数 | `30`                   | `chat.send` 请求超时秒数                                                           |
+| `openclaw.streamTimeoutSeconds` | JVM 参数 | `180`                  | 等待流式回复结束的超时秒数                                                                |
 
 Token 读取优先级：
 
